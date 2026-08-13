@@ -1,8 +1,5 @@
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <array>
+#include <cctype>
 #include <string>
 
 #include <QApplication>
@@ -12,6 +9,8 @@
 #include <QHBoxLayout>
 #include <QMessageBox>
 #include <QFile>
+#include <QDir>
+#include <QCoreApplication>
 #include <QTimer>
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrentRun>
@@ -31,6 +30,14 @@
 #include "debuglog.h"
 
 static const int kCalibFrameCount = 30;
+
+static std::string SanitizeFolderName(const std::string &name) {
+  std::string out;
+  for (char c : name) {
+    out += (isalnum((unsigned char) c) || c == '-' || c == '_') ? c : '_';
+  }
+  return out.empty() ? "robot" : out;
+}
 
 // ===========================================================================================================
 static const QString kPrimaryButtonStyle =
@@ -356,15 +363,11 @@ void CalibWindow::_checkConnection() {
 }
 
 std::string CalibWindow::_GetFramesDirectory() {
-  std::string path;
-  if (access("/media/pi/Frames", R_OK | X_OK) == 0) {
-    path = "/media/pi/Frames/";
-  } else {
-    std::string home { getenv("HOME") };
-    path = home + "/Frames/";
-  }
-  mkdir(path.c_str(), 0777);
-  return path;
+  QDir dir(QCoreApplication::applicationDirPath());
+  dir.cdUp();
+  QString relPath = "Frames/" + QString::fromStdString(SanitizeFolderName(_robot.name));
+  dir.mkpath(relPath);
+  return dir.filePath(relPath).toStdString() + "/";
 }
 
 // Syncs _savedFrameCount/_frameIndex with what's actually on disk. 

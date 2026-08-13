@@ -1,7 +1,3 @@
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <string>
 
@@ -275,24 +271,16 @@ void MainWindow::_handleCalibWindowClosed() {
 }
 
 std::string MainWindow::_GetFramesDirectory() {
-  std::string path;
-  if (access("/media/pi/Frames", R_OK | X_OK) == 0) {
-    path = "/media/pi/Frames/";
-  } else {
-    std::string home { getenv("HOME") };
-    path = home + "/Frames/";
-  }
-  mkdir(path.c_str(), 0777);
-  return path;
+  QDir dir(QCoreApplication::applicationDirPath());
+  dir.cdUp();
+  dir.mkpath("Frames");
+  return dir.filePath("Frames/").toStdString();
 }
 
-// Near-identical to CalibWindow::_ClearSavedFrames, but with no frame-counter UI to
-// update — this runs from the settings dialog below, which can happen before any
-// CalibWindow (and its "X / 30" counter) exists.
 int MainWindow::_ClearSavedFrames() {
   std::string path = _GetFramesDirectory();
   std::vector<cv::String> filenames;
-  cv::glob(path + "*.png", filenames, false);
+  cv::glob(path + "*.png", filenames, true);
   int removed = 0;
   for (const cv::String &fn : filenames) {
     if (QFile::remove(QString::fromStdString(fn))) ++removed;
@@ -301,8 +289,6 @@ int MainWindow::_ClearSavedFrames() {
 }
 
 std::string MainWindow::_ConfigFilePath() {
-  // DESTDIR=build in CalibGUI.pro puts the binary at CalibGUI/build/<exe>, so one cdUp()
-  // from applicationDirPath() lands back at the CalibGUI project root.
   QDir dir(QCoreApplication::applicationDirPath());
   dir.cdUp();
   dir.mkpath("config");
@@ -426,7 +412,7 @@ void MainWindow::_handleSettingsClicked() {
 
   if (boardChanged) {
     std::vector<cv::String> existingFrames;
-    cv::glob(_GetFramesDirectory() + "*.png", existingFrames, false);
+    cv::glob(_GetFramesDirectory() + "*.png", existingFrames, true);
     int savedFrameCount = (int) existingFrames.size();
 
     if (savedFrameCount > 0) {

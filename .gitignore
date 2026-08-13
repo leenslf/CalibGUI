@@ -6,3 +6,4 @@ build/
 # Editor/OS cruft
 *~
 .DS_Store
+Frames/*
