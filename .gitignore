@@ -1,0 +1,8 @@
+# qmake/Qt build artifacts
+Makefile
+.qmake.stash
+build/
+
+# Editor/OS cruft
+*~
+.DS_Store

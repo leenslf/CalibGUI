@@ -1,0 +1,7 @@
+%YAML:1.0
+---
+squares_x: 6
+squares_y: 8
+square_length_m: 2.1999999880790710e-02
+marker_length_m: 1.6000000759959221e-02
+min_valid_frames: 4
