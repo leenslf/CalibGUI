@@ -15,13 +15,12 @@ camera-handling widgets and calibration workflow, scoped down to just:
 Requires the same sibling submodules as RobotGUI: `rhex-api`, `RoboMETU`, and
 `udp-discovery`. CalibGUI is a
 standalone qmake project.
-TODO: THESE VARIABLES SHOULD BE ALREADY SET?
 
 ```sh
-export INSTALL_PREFIX=/home/leen/robot.linux       
-export RHEXAPI_DIR=/home/leen/robot.linux/rhex-api
-export ROBOMETU_DIR=/home/leen/robot.linux/RoboMETU
-export UDPD_DIR=/home/leen/robot.linux/udp-discovery
+export INSTALL_PREFIX=$HOME/robot       
+export RHEXAPI_DIR=$INSTALL_PREFIX/rhex-api
+export ROBOMETU_DIR=$INSTALL_PREFIX/RoboMETU
+export UDPD_DIR=$INSTALL_PREFIX/udp-discovery
 qmake CalibGUI.pro
 make
 ```
