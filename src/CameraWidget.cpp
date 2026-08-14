@@ -94,6 +94,11 @@ bool CameraWidget::SetQmlGlSink( GstElement *qmlglsink ) {
 }
 
 unsigned long CameraWidget::GetWindow() {
-  
+
   return (_cam)?_cam->winId():0;
+}
+
+QImage CameraWidget::grabFrame() {
+  if (!_camqtqml) return QImage();
+  return _camqtqml->grabFramebuffer();
 }

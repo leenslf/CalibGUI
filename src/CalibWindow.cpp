@@ -261,6 +261,11 @@ bool CalibWindow::_attemptConnect(QString *errorMessage) {
       rhex_ = nullptr;
       return false;
     }
+
+    int numCams = rhex_->GetNumCameras();
+    for (int i = 0; i < numCams; i++) {
+      rhex_->SetCameraStreamOverlay(i, false);
+    }
   } catch (const std::runtime_error &e) {
     ERRPRINTF("[EE] CalibWindow::_attemptConnect: %s\n", e.what());
     *errorMessage = "Robot bağlantısı kurulamadı!";
@@ -370,7 +375,15 @@ std::string CalibWindow::_GetFramesDirectory() {
   return dir.filePath(relPath).toStdString() + "/";
 }
 
-// Syncs _savedFrameCount/_frameIndex with what's actually on disk. 
+std::string CalibWindow::_GetCalibrationFilePath(int cameraIndex) {
+  QDir dir(QCoreApplication::applicationDirPath());
+  dir.cdUp();
+  QString relPath = "Calibrations/" + QString::fromStdString(SanitizeFolderName(_robot.name));
+  dir.mkpath(relPath);
+  return dir.filePath(relPath).toStdString() + "/" + std::to_string(cameraIndex) + ".yaml";
+}
+
+// Syncs _savedFrameCount/_frameIndex with what's actually on disk.
 void CalibWindow::_RefreshSavedFrameCount() {
   std::vector<cv::String> filenames;
   cv::glob(_GetFramesDirectory() + "*.png", filenames, false);
@@ -400,7 +413,7 @@ void CalibWindow::_ShowStatus(const std::string &msg, bool error) {
 }
 
 void CalibWindow::_handleSaveFrame() {
-  if (!connected_ || !rhex_ || !_camlist_widget) return;
+  if (!connected_ || !rhex_ || !_camlist_widget || !_pview) return;
 
   int primary, secondary;
   _camlist_widget->getState(&primary, &secondary);
@@ -408,21 +421,29 @@ void CalibWindow::_handleSaveFrame() {
     _ShowStatus("Kaydetmeden önce bir kamera seçin.", true);
     return;
   }
+
+  QImage frame = _pview->grabFrame();
+  if (frame.isNull()) {
+    ERRPRINTF("[EE] CalibWindow::_handleSaveFrame: grabFrame returned a null image\n");
+    _ShowStatus("HATA: Kare kaydedilemedi.", true);
+    return;
+  }
+
   int nextIndex = _frameIndex + 1;
   char buf[16];
   snprintf(buf, sizeof(buf), "%03d.png", nextIndex);
   std::string path = _GetFramesDirectory() + buf;
 
-  try {
-    rhex_->SaveCameraFrame(primary, path);
-    _frameIndex = nextIndex;
-    _ShowStatus("Kare kaydedildi: " + path);
-    ++_savedFrameCount;
-    _UpdateSaveFrameCounter();
-  } catch (const std::runtime_error &e) {
-    ERRPRINTF("[EE] CalibWindow::_handleSaveFrame: %s\n", e.what());
+  if (!frame.save(QString::fromStdString(path), "PNG")) {
+    ERRPRINTF("[EE] CalibWindow::_handleSaveFrame: failed to write %s\n", path.c_str());
     _ShowStatus("HATA: Kare kaydedilemedi.", true);
+    return;
   }
+
+  _frameIndex = nextIndex;
+  _ShowStatus("Kare kaydedildi: " + path);
+  ++_savedFrameCount;
+  _UpdateSaveFrameCounter();
 }
 
 void CalibWindow::_handleCalibrate() {
@@ -454,15 +475,15 @@ void CalibWindow::_handleCalibrationFinished() {
     return;
   }
 
-  if (!(connected_ && rhex_ && _camlist_widget && result.distCoeffs.total() >= 5 && result.fx > 0.0f && result.fy > 0.0f)) {
-    _ShowStatus("Kalibrasyon başarılı. UYARI: Robota bağlı değil.", true);
+  if (!(_camlist_widget && result.distCoeffs.total() >= 5 && result.fx > 0.0f && result.fy > 0.0f)) {
+    _ShowStatus("Kalibrasyon başarılı. UYARI: Sonuç geçersiz.", true);
     return;
   }
 
   int primary, secondary;
   _camlist_widget->getState(&primary, &secondary);
   if (primary < 0) {
-    _ShowStatus("Kalibrasyon başarılı. UYARI: Sonucu göndermek için bir kamera seçin.", true);
+    _ShowStatus("Kalibrasyon başarılı. UYARI: Kaydetmek için bir kamera seçin.", true);
     return;
   }
 
@@ -471,13 +492,21 @@ void CalibWindow::_handleCalibrationFinished() {
     (float) result.distCoeffs.at<double>(2), (float) result.distCoeffs.at<double>(3),
     (float) result.distCoeffs.at<double>(4)
   };
-  try {
-    rhex_->SetCameraUndistortParams(primary, result.fx, result.fy, result.cx, result.cy, dc);
-    _ShowStatus("Kalibrasyon başarılı. Robota gönderildi.");
-  } catch (const std::runtime_error &e) {
-    ERRPRINTF("[EE] CalibWindow::_handleCalibrationFinished: %s\n", e.what());
-    _ShowStatus("HATA: Kalibrasyon robota gönderilemedi.", true);
+  std::string yamlPath = _GetCalibrationFilePath(primary);
+  cv::FileStorage fs(yamlPath, cv::FileStorage::WRITE);
+  if (!fs.isOpened()) {
+    ERRPRINTF("[EE] CalibWindow::_handleCalibrationFinished: could not open %s for writing\n",
+              yamlPath.c_str());
+    _ShowStatus("HATA: Kalibrasyon dosyaya kaydedilemedi.", true);
+    return;
   }
+  fs << "fx" << result.fx;
+  fs << "fy" << result.fy;
+  fs << "cx" << result.cx;
+  fs << "cy" << result.cy;
+  fs << "distortion_coeffs" << std::vector<float>(dc.begin(), dc.end());
+  fs.release();
+  _ShowStatus("Kalibrasyon başarılı. Kaydedildi: " + yamlPath);
 }
 
 // Deletes all saved frames in the frames directory after a user confirmation dialog.

@@ -59,6 +59,7 @@ private:
   void _initCalibUI(QVBoxLayout *layout);
 
   std::string _GetFramesDirectory();
+  std::string _GetCalibrationFilePath(int cameraIndex);
   void        _RefreshSavedFrameCount();
   void        _UpdateSaveFrameCounter();
   void        _ShowStatus(const std::string &msg, bool error = false);

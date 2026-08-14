@@ -17,7 +17,7 @@ Requires the same sibling submodules as RobotGUI: `rhex-api`, `RoboMETU`, and
 standalone qmake project.
 
 ```sh
-export INSTALL_PREFIX=$HOME/robot       
+export INSTALL_PREFIX=$HOME/robot.linux       
 export RHEXAPI_DIR=$INSTALL_PREFIX/rhex-api
 export ROBOMETU_DIR=$INSTALL_PREFIX/RoboMETU
 export UDPD_DIR=$INSTALL_PREFIX/udp-discovery
