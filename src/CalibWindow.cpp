@@ -31,6 +31,17 @@
 
 static const int kCalibFrameCount = 30;
 
+static const char *kFrameExtensions[] = { "*.png", "*.jpg", "*.jpeg" };
+
+static void GlobFrameFiles(const std::string &dirPath, std::vector<cv::String> *filenames) {
+  filenames->clear();
+  for (const char *ext : kFrameExtensions) {
+    std::vector<cv::String> matches;
+    cv::glob(dirPath + ext, matches, false);
+    filenames->insert(filenames->end(), matches.begin(), matches.end());
+  }
+}
+
 static std::string SanitizeFolderName(const std::string &name) {
   std::string out;
   for (char c : name) {
@@ -78,7 +89,7 @@ static CalibrationResult _RunCalibration(std::string path, CalibSettings setting
   CalibrationResult result;
 
   std::vector<cv::String> filenames;
-  cv::glob(path + "*.png", filenames, false);
+  GlobFrameFiles(path, &filenames);
 
   if ((int) filenames.size() < kCalibFrameCount) {
     result.errorMessage = QString("HATA: Kalibrasyon için yeterli kare yok (%1 / %2).")
@@ -386,7 +397,7 @@ std::string CalibWindow::_GetCalibrationFilePath(int cameraIndex) {
 // Syncs _savedFrameCount/_frameIndex with what's actually on disk.
 void CalibWindow::_RefreshSavedFrameCount() {
   std::vector<cv::String> filenames;
-  cv::glob(_GetFramesDirectory() + "*.png", filenames, false);
+  GlobFrameFiles(_GetFramesDirectory(), &filenames);
 
   _savedFrameCount = (int) filenames.size();
   _frameIndex = 0;
@@ -528,7 +539,7 @@ void CalibWindow::_handleClearFrames() {
 int CalibWindow::_ClearSavedFrames() {
   std::string path = _GetFramesDirectory();
   std::vector<cv::String> filenames;
-  cv::glob(path + "*.png", filenames, false);
+  GlobFrameFiles(path, &filenames);
   int removed = 0;
   for (const cv::String &fn : filenames) {
     if (QFile::remove(QString::fromStdString(fn))) ++removed;
