@@ -12,6 +12,7 @@
 #include <QDir>
 #include <QCoreApplication>
 #include <QTimer>
+#include <QShortcut>
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrentRun>
 
@@ -82,6 +83,7 @@ struct CalibrationResult {
   float   cx = 0.0f;
   float   cy = 0.0f;
   cv::Mat distCoeffs;
+  std::vector<float> perViewErrors;
 };
 
 // Runs entirely on a QtConcurrent worker thread. 
@@ -134,10 +136,12 @@ static CalibrationResult _RunCalibration(std::string path, CalibSettings setting
 
   std::vector<cv::Mat> rvecs, tvecs;
   cv::Mat cameraMatrix;
+  cv::Mat stdDeviationsIntrinsics, stdDeviationsExtrinsics, perViewErrors;
   try {
     cv::aruco::calibrateCameraCharuco(
       allCharucoCorners, allCharucoIds, board, imageSize,
-      cameraMatrix, result.distCoeffs, rvecs, tvecs);
+      cameraMatrix, result.distCoeffs, rvecs, tvecs,
+      stdDeviationsIntrinsics, stdDeviationsExtrinsics, perViewErrors);
   } catch (const cv::Exception &e) {
     ERRPRINTF("[EE] CalibWindow::_RunCalibration: %s\n", e.what());
     result.errorMessage = "HATA: Kalibrasyon başarısız oldu.";
@@ -147,6 +151,11 @@ static CalibrationResult _RunCalibration(std::string path, CalibSettings setting
   result.fy = (float) cameraMatrix.at<double>(1, 1);
   result.cx = (float) cameraMatrix.at<double>(0, 2);
   result.cy = (float) cameraMatrix.at<double>(1, 2);
+
+  result.perViewErrors.reserve(perViewErrors.total());
+  for (int i = 0; i < (int) perViewErrors.total(); ++i) {
+    result.perViewErrors.push_back((float) perViewErrors.at<double>(i));
+  }
 
   result.success = true;
   return result;
@@ -322,8 +331,13 @@ void CalibWindow::_initCalibUI(QVBoxLayout *layout) {
   QHBoxLayout *btnRow = new QHBoxLayout;
   _saveFrameBtn = new QPushButton("Kare Kaydet");
   _saveFrameBtn->setStyleSheet(kPrimaryButtonStyle);
+  _saveFrameBtn->setFocusPolicy(Qt::NoFocus);
   connect(_saveFrameBtn, &QPushButton::released, this, &CalibWindow::_handleSaveFrame);
   btnRow->addWidget(_saveFrameBtn, 2);
+
+  QShortcut *saveFrameShortcut = new QShortcut(QKeySequence(Qt::Key_Space), this);
+  saveFrameShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+  connect(saveFrameShortcut, &QShortcut::activated, this, &CalibWindow::_handleSaveFrame);
 
   _calibrateBtn = new QPushButton("KALİBRE ET");
   _calibrateBtn->setStyleSheet(kPrimaryButtonStyle);
@@ -407,8 +421,12 @@ void CalibWindow::_RefreshSavedFrameCount() {
     if (slash != std::string::npos) base = base.substr(slash + 1);
     size_t dot = base.find_last_of('.');
     if (dot != std::string::npos) base = base.substr(0, dot);
-    int idx = std::stoi(base);
-    if (idx > _frameIndex) _frameIndex = idx;
+    try {
+      int idx = std::stoi(base);
+      if (idx > _frameIndex) _frameIndex = idx;
+    } catch (const std::invalid_argument &) {
+      // Not a plain numeric frame filename (e.g. left over from an older naming scheme); skip it.
+    }
   }
 }
 
@@ -516,6 +534,7 @@ void CalibWindow::_handleCalibrationFinished() {
   fs << "cx" << result.cx;
   fs << "cy" << result.cy;
   fs << "distortion_coeffs" << std::vector<float>(dc.begin(), dc.end());
+  fs << "per_image_reprojection_errors" << result.perViewErrors;
   fs.release();
   _ShowStatus("Kalibrasyon başarılı. Kaydedildi: " + yamlPath);
 }
