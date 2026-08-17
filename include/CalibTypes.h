@@ -3,11 +3,10 @@
 
 #include <string>
 
-/** A robot found via peer discovery, picked from MainWindow's list and handed to
-    CalibWindow to attempt a connection to. */
-struct DiscoveredRobot {
+/** A camera stream found via peer discovery, picked from MainWindow's list and handed
+    to CalibWindow to connect to. */
+struct DiscoveredCamera {
   std::string name;
-  std::string type; // "net" -> unencrypted
   std::string ip;
   int         port;
 };

@@ -13,6 +13,7 @@
 #include <QCoreApplication>
 #include <QTimer>
 #include <QShortcut>
+#include <QDateTime>
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrentRun>
 
@@ -23,7 +24,6 @@
 
 #include "CalibWindow.h"
 #include "CameraWidget.h"
-#include "CamListWidget.h"
 
 #include "config.h"
 #include "Theme.h"
@@ -33,6 +33,12 @@
 static const int kCalibFrameCount = 30;
 
 static const char *kFrameExtensions[] = { "*.png", "*.jpg", "*.jpeg" };
+
+// Resend interval for the UDP "hello" that keeps the stream script's subscription
+// alive; must be well under the script's own subscriber timeout (3s).
+static const int kHelloIntervalMs = 1000;
+// How long without a received frame before we consider the stream unreachable.
+static const qint64 kLivenessTimeoutMs = 4000;
 
 static void GlobFrameFiles(const std::string &dirPath, std::vector<cv::String> *filenames) {
   filenames->clear();
@@ -48,7 +54,7 @@ static std::string SanitizeFolderName(const std::string &name) {
   for (char c : name) {
     out += (isalnum((unsigned char) c) || c == '-' || c == '_') ? c : '_';
   }
-  return out.empty() ? "robot" : out;
+  return out.empty() ? "kamera" : out;
 }
 
 // ===========================================================================================================
@@ -86,7 +92,7 @@ struct CalibrationResult {
   std::vector<float> perViewErrors;
 };
 
-// Runs entirely on a QtConcurrent worker thread. 
+// Runs entirely on a QtConcurrent worker thread.
 static CalibrationResult _RunCalibration(std::string path, CalibSettings settings) {
   CalibrationResult result;
 
@@ -161,9 +167,9 @@ static CalibrationResult _RunCalibration(std::string path, CalibSettings setting
   return result;
 }
 
-CalibWindow::CalibWindow(const DiscoveredRobot &robot, const CalibSettings &settings,
+CalibWindow::CalibWindow(const DiscoveredCamera &camera, const CalibSettings &settings,
                           QWidget *parent)
-  : QWidget(parent), _robot(robot), _settings(settings) {
+  : QWidget(parent), _camera(camera), _settings(settings) {
   _layout = new QVBoxLayout(this);
 
   _connectingLabel = new QLabel("Bağlanıyor...");
@@ -173,129 +179,24 @@ CalibWindow::CalibWindow(const DiscoveredRobot &robot, const CalibSettings &sett
 }
 
 void CalibWindow::start() {
-  QString errorMessage;
-  if (_attemptConnect(&errorMessage)) {
-    delete _connectingLabel;
-    _connectingLabel = nullptr;
-    _initCalibUI(_layout);
+  delete _connectingLabel;
+  _connectingLabel = nullptr;
+  _initCalibUI(_layout);
 
-    _connectionTimer = new QTimer(this);
-    connect(_connectionTimer, &QTimer::timeout, this, &CalibWindow::_checkConnection);
-    _connectionTimer->start(500);
-    return;
-  }
+  _socket = new QUdpSocket(this);
+  _socket->bind(LOCAL_PORT);
+  connect(_socket, &QUdpSocket::readyRead, this, &CalibWindow::_handleReadyRead);
+  _connected = true;
 
-  _connectingLabel->setText(errorMessage);
-
-  QPushButton *backBtn = new QPushButton("Geri");
-  backBtn->setStyleSheet(kSecondaryButtonStyle);
-  backBtn->setMinimumWidth(90);
-  connect(backBtn, &QPushButton::released, this, &CalibWindow::closed);
-  QHBoxLayout *backRow = new QHBoxLayout;
-  backRow->addStretch();
-  backRow->addWidget(backBtn);
-  backRow->addStretch();
-  _layout->addLayout(backRow);
-  _layout->addStretch();
+  _helloTimer = new QTimer(this);
+  connect(_helloTimer, &QTimer::timeout, this, &CalibWindow::_handleHelloTimer);
+  _helloTimer->start(kHelloIntervalMs);
+  _handleHelloTimer();
 }
 
 CalibWindow::~CalibWindow() {
-  // Wait out any background calibration before tearing down rhex_
+  // Wait out any background calibration before tearing down.
   if (_calibWatcher && _calibWatcher->isRunning()) _calibWatcher->waitForFinished();
-
-  if (connected_ && rhex_) {
-    try {
-      rhex_->Disconnect(false);
-    } catch (const std::runtime_error &e) {
-      ERRPRINTF("[EE] CalibWindow::~CalibWindow: %s\n", e.what());
-    }
-    delete rhex_;
-    rhex_ = nullptr;
-  }
-}
-
-// Ported from RobotGUI/src/RobotWindow.cpp:653-784 
-bool CalibWindow::_attemptConnect(QString *errorMessage) {
-  bool crypto = (_robot.type != "net");
-
-  unsigned short front_camera_port { (unsigned short) (LOCAL_PORT + 1) };
-  unsigned short rear_camera_port  { (unsigned short) (LOCAL_PORT + 2) };
-  unsigned short microphone_port   { (unsigned short) (LOCAL_PORT + 7) };
-  MultimediaParameters_t multimedia_parameters {
-    front_camera_port, rear_camera_port, microphone_port };
-
-  rhex_ = new RHexAPI("lo", multimedia_parameters);
-  connected_ = true;
-
-  try {
-    rhex_->SetQtQmlOutput(true);
-
-    int res;
-    if (crypto) {
-      res = rhex_->Connect(_robot.ip, _robot.port, "rhex", PLACEHOLDER_PASSWORD,
-                            "/etc/certs/ca-cert.pem");
-    } else {
-      res = rhex_->Connect(_robot.ip, _robot.port, LOCAL_PORT, "rhex",
-                            PLACEHOLDER_PASSWORD);
-    }
-
-    if (res < 0) {
-      switch (res) {
-      case RHEX_ERR_CONNECT_BUSY:
-      case RHEX_ERR_CONNECT_DUPID:
-        *errorMessage =
-          "Bağlantı kurulamadı: Robota bağlantılı aktif başka bir konsol var.";
-        break;
-      case RHEX_ERR_CONNECT_DENIED:
-        *errorMessage = "Bağlantı kurulamadı: Yanlış şifre veya kullanıcı.";
-        break;
-      case RHEX_ERR_CONNECT_TIMEOUT:
-        *errorMessage = "Bağlantı kurulamadı: Zaman aşımı. Tekrar deneyin.";
-        break;
-      case RHEX_ERR_CONNECT_DATABASE:
-        *errorMessage = "Bağlantı kurulamadı: Veritabanı hatası. Tekrar deneyin.";
-        break;
-      case RHEX_ERR_CONNECT_NETREMOTE:
-        *errorMessage =
-          "Bağlantı kurulamadı: Kriptosuz iletişim hatası. Tekrar deneyin.";
-        break;
-      case RHEX_ERR_CONNECT_CRYPTOREMOTE:
-        *errorMessage =
-          "Bağlantı kurulamadı: Kriptolu iletişim hatası. Tekrar deneyin.";
-        break;
-      case RHEX_ERR_CONNECT_BADVERSION: {
-        int major, minor, apimajor, apiminor;
-        rhex_->GetRobotAPIVersion(&major, &minor);
-        rhex_->GetLocalAPIVersion(&apimajor, &apiminor);
-        *errorMessage =
-          QString("Bağlantı hatası: Uyumsuz yazılımlar (Robot: %1.%2, Konsol: %3.%4).")
-          .arg(major).arg(minor).arg(apimajor).arg(apiminor);
-        break;
-      }
-      default:
-        *errorMessage = "Bilinmeyen bir sebeple bağlantı kurulamadı. Tekrar deneyin.";
-        break;
-      }
-      connected_ = false;
-      delete rhex_;
-      rhex_ = nullptr;
-      return false;
-    }
-
-    int numCams = rhex_->GetNumCameras();
-    for (int i = 0; i < numCams; i++) {
-      rhex_->SetCameraStreamOverlay(i, false);
-    }
-  } catch (const std::runtime_error &e) {
-    ERRPRINTF("[EE] CalibWindow::_attemptConnect: %s\n", e.what());
-    *errorMessage = "Robot bağlantısı kurulamadı!";
-    connected_ = false;
-    delete rhex_;
-    rhex_ = nullptr;
-    return false;
-  }
-
-  return true;
 }
 
 void CalibWindow::_initCalibUI(QVBoxLayout *layout) {
@@ -313,13 +214,9 @@ void CalibWindow::_initCalibUI(QVBoxLayout *layout) {
   _RefreshSavedFrameCount();
   _UpdateSaveFrameCounter();
 
-  _pview = new CameraWidget(true);
-  _sview = new CameraWidget(true);
+  _pview = new CameraWidget;
+  _pview->setState(true);
   layout->addWidget(_pview);
-
-  _camlist_widget = new CamListWidget(_pview, _sview, true);
-  _camlist_widget->setRHexAPI(rhex_);
-  layout->addWidget(_camlist_widget);
 
   _calibInstructions = new QLabel(
     "İpucu: Tahtanın tamamı net görünsün; farklı açı, mesafe ve konumlardan "
@@ -362,40 +259,61 @@ void CalibWindow::_initCalibUI(QVBoxLayout *layout) {
   layout->addWidget(_statusLabel);
 
   layout->addStretch();
+
+  _ShowStatus("Görüntü bekleniyor...");
 }
 
 void CalibWindow::_handleDisconnect() {
-  if (!connected_ || !rhex_) return;
+  if (!_connected) return;
   _disconnectBtn->setEnabled(false);
-  _connectionTimer->stop();
-
-  try {
-    _camlist_widget->setRHexAPI(nullptr);
-    rhex_->Disconnect(false);
-  } catch (const std::runtime_error &e) {
-    ERRPRINTF("[EE] CalibWindow::_handleDisconnect: %s\n", e.what());
+  if (_helloTimer) _helloTimer->stop();
+  if (_socket) {
+    _socket->close();
+    delete _socket;
+    _socket = nullptr;
   }
-  delete rhex_;
-  rhex_ = nullptr;
-  connected_ = false;
+  _connected = false;
 
   emit closed();
 }
 
-void CalibWindow::_checkConnection() {
-  // Ported from RobotGUI/src/RobotWindow.cpp:979-991 (_checkConnection) — a failed ping is only surfaced as a status message
-  if (!connected_ || !rhex_) return;
-  try {
-    rhex_->SendPing();
-  } catch (const std::runtime_error &e) {
-    _ShowStatus("Şu anda robota ulaşılamıyor!", true);
+void CalibWindow::_handleHelloTimer() {
+  if (!_connected || !_socket) return;
+
+  static const char kHello[] = "hello";
+  _socket->writeDatagram(kHello, sizeof(kHello) - 1,
+                          QHostAddress(QString::fromStdString(_camera.ip)), _camera.port);
+
+  if (_lastFrameTimeMs > 0 &&
+      QDateTime::currentMSecsSinceEpoch() - _lastFrameTimeMs > kLivenessTimeoutMs) {
+    _stalled = true;
+    _ShowStatus("Şu anda kameraya ulaşılamıyor!", true);
+  }
+}
+
+void CalibWindow::_handleReadyRead() {
+  while (_socket && _socket->hasPendingDatagrams()) {
+    QByteArray datagram;
+    datagram.resize((int) _socket->pendingDatagramSize());
+    _socket->readDatagram(datagram.data(), datagram.size());
+
+    QImage frame = QImage::fromData(datagram, "JPG");
+    if (frame.isNull()) continue;
+
+    bool wasStale = _lastFrameTimeMs == 0 || _stalled;
+    _lastFrameTimeMs = QDateTime::currentMSecsSinceEpoch();
+    _pview->setFrame(frame);
+    if (wasStale) {
+      _stalled = false;
+      _ShowStatus("Görüntü alınıyor.");
+    }
   }
 }
 
 std::string CalibWindow::_GetFramesDirectory() {
   QDir dir(QCoreApplication::applicationDirPath());
   dir.cdUp();
-  QString relPath = "Frames/" + QString::fromStdString(SanitizeFolderName(_robot.name));
+  QString relPath = "Frames/" + QString::fromStdString(SanitizeFolderName(_camera.name));
   dir.mkpath(relPath);
   return dir.filePath(relPath).toStdString() + "/";
 }
@@ -403,7 +321,7 @@ std::string CalibWindow::_GetFramesDirectory() {
 std::string CalibWindow::_GetCalibrationFilePath(int cameraIndex) {
   QDir dir(QCoreApplication::applicationDirPath());
   dir.cdUp();
-  QString relPath = "Calibrations/" + QString::fromStdString(SanitizeFolderName(_robot.name));
+  QString relPath = "Calibrations/" + QString::fromStdString(SanitizeFolderName(_camera.name));
   dir.mkpath(relPath);
   return dir.filePath(relPath).toStdString() + "/" + std::to_string(cameraIndex) + ".yaml";
 }
@@ -442,19 +360,11 @@ void CalibWindow::_ShowStatus(const std::string &msg, bool error) {
 }
 
 void CalibWindow::_handleSaveFrame() {
-  if (!connected_ || !rhex_ || !_camlist_widget || !_pview) return;
-
-  int primary, secondary;
-  _camlist_widget->getState(&primary, &secondary);
-  if (primary < 0) {
-    _ShowStatus("Kaydetmeden önce bir kamera seçin.", true);
-    return;
-  }
+  if (!_connected || !_pview) return;
 
   QImage frame = _pview->grabFrame();
   if (frame.isNull()) {
-    ERRPRINTF("[EE] CalibWindow::_handleSaveFrame: grabFrame returned a null image\n");
-    _ShowStatus("HATA: Kare kaydedilemedi.", true);
+    _ShowStatus("Kaydetmeden önce görüntü alınmasını bekleyin.", true);
     return;
   }
 
@@ -483,7 +393,7 @@ void CalibWindow::_handleCalibrate() {
     connect(_calibWatcher, &QFutureWatcher<CalibrationResult>::finished, this, &CalibWindow::_handleCalibrationFinished);
   }
 
-  // The heavy lifting (image decode, ChArUco detection, bundle adjustment) runs on a QtConcurrent worker thread via _RunCalibration 
+  // The heavy lifting (image decode, ChArUco detection, bundle adjustment) runs on a QtConcurrent worker thread via _RunCalibration
   _calibrateBtn->setEnabled(false);
   _saveFrameBtn->setEnabled(false);
   _clearFramesBtn->setEnabled(false);
@@ -504,15 +414,8 @@ void CalibWindow::_handleCalibrationFinished() {
     return;
   }
 
-  if (!(_camlist_widget && result.distCoeffs.total() >= 5 && result.fx > 0.0f && result.fy > 0.0f)) {
+  if (!(result.distCoeffs.total() >= 5 && result.fx > 0.0f && result.fy > 0.0f)) {
     _ShowStatus("Kalibrasyon başarılı. UYARI: Sonuç geçersiz.", true);
-    return;
-  }
-
-  int primary, secondary;
-  _camlist_widget->getState(&primary, &secondary);
-  if (primary < 0) {
-    _ShowStatus("Kalibrasyon başarılı. UYARI: Kaydetmek için bir kamera seçin.", true);
     return;
   }
 
@@ -521,7 +424,7 @@ void CalibWindow::_handleCalibrationFinished() {
     (float) result.distCoeffs.at<double>(2), (float) result.distCoeffs.at<double>(3),
     (float) result.distCoeffs.at<double>(4)
   };
-  std::string yamlPath = _GetCalibrationFilePath(primary);
+  std::string yamlPath = _GetCalibrationFilePath(0);
   cv::FileStorage fs(yamlPath, cv::FileStorage::WRITE);
   if (!fs.isOpened()) {
     ERRPRINTF("[EE] CalibWindow::_handleCalibrationFinished: could not open %s for writing\n",

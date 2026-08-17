@@ -6,8 +6,7 @@
 #include <QString>
 #include <QWidget>
 #include <QFutureWatcher>
-
-#include <RHexAPI.h>
+#include <QUdpSocket>
 
 #include "CalibTypes.h"
 
@@ -17,28 +16,27 @@ class QLabel;
 class QTimer;
 
 class CameraWidget;
-class CamListWidget;
 
 struct CalibrationResult;
 
-/** Owns a single connect attempt and calibration workflow for one robot. Constructed
-    by MainWindow with a picked DiscoveredRobot and the current CalibSettings, then
-    embedded as a page in MainWindow's QStackedWidget so the transition stays within
-    one real top-level window. The constructor only builds a "Bağlanıyor..." skeleton;
-    MainWindow calls start() right after making the page visible, which then attempts
-    the connection (still a blocking call, matching the app's original connect UX) and
-    either builds the calibration UI (on success) or shows an error with a way back to
-    MainWindow (on failure). Emits closed() whenever MainWindow should take back
-    control. */
+/** Owns a single stream-view + calibration workflow for one discovered camera.
+    Constructed by MainWindow with a picked DiscoveredCamera and the current
+    CalibSettings, then embedded as a page in MainWindow's QStackedWidget so the
+    transition stays within one real top-level window. The constructor only builds a
+    "Bağlanıyor..." skeleton; MainWindow calls start() right after making the page
+    visible, which sends the initial UDP hello to the camera's stream port and builds
+    the calibration UI immediately (there's no handshake to wait on — frames just
+    start arriving once the stream script sees the hello). Emits closed() whenever
+    MainWindow should take back control. */
 class CalibWindow : public QWidget {
   Q_OBJECT
 
 public:
-  CalibWindow(const DiscoveredRobot &robot, const CalibSettings &settings,
+  CalibWindow(const DiscoveredCamera &camera, const CalibSettings &settings,
               QWidget *parent = nullptr);
   virtual ~CalibWindow();
 
-  // Attempts the connection and builds the rest of the UI. Deferred out of the
+  // Sends the initial hello and builds the rest of the UI. Deferred out of the
   // constructor so MainWindow can make this page visible first — see the class
   // comment above.
   void start();
@@ -48,14 +46,14 @@ signals:
 
 private slots:
   void _handleDisconnect();
-  void _checkConnection();
+  void _handleHelloTimer();
+  void _handleReadyRead();
   void _handleSaveFrame();
   void _handleCalibrate();
   void _handleCalibrationFinished();
   void _handleClearFrames();
 
 private:
-  bool _attemptConnect(QString *errorMessage);
   void _initCalibUI(QVBoxLayout *layout);
 
   std::string _GetFramesDirectory();
@@ -65,15 +63,13 @@ private:
   void        _ShowStatus(const std::string &msg, bool error = false);
   int         _ClearSavedFrames();
 
-  DiscoveredRobot _robot;
-  CalibSettings   _settings;
+  DiscoveredCamera _camera;
+  CalibSettings    _settings;
 
   QVBoxLayout *_layout = nullptr;
   QLabel      *_connectingLabel = nullptr;
 
-  CameraWidget  *_pview = nullptr;
-  CameraWidget  *_sview = nullptr;
-  CamListWidget *_camlist_widget = nullptr;
+  CameraWidget *_pview = nullptr;
 
   QPushButton *_saveFrameBtn = nullptr;
   QLabel      *_saveFrameCounter = nullptr;
@@ -83,12 +79,14 @@ private:
   QPushButton *_disconnectBtn = nullptr;
   QLabel      *_statusLabel = nullptr;
 
-  QTimer *_connectionTimer = nullptr;
+  QTimer *_helloTimer = nullptr;
 
   QFutureWatcher<CalibrationResult> *_calibWatcher = nullptr;
 
-  RHexAPI *rhex_ = nullptr;
-  bool     connected_ = false;
+  QUdpSocket *_socket = nullptr;
+  bool        _connected = false;
+  bool        _stalled = false;
+  qint64      _lastFrameTimeMs = 0;
 
   int _frameIndex = 0;
   int _savedFrameCount = 0;

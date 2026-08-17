@@ -1,25 +1,31 @@
 # CalibGUI
 
-Minimal Qt console for camera calibration on a live robot. It reuses RobotGUI's
-camera-handling widgets and calibration workflow, scoped down to just:
+Minimal Qt console for camera calibration. Scoped to just:
 
-1. Connect to a live robot.
-2. Choose a camera from the set of available cameras on that robot.
-3. Capture calibration images (`SaveCameraFrame`).
+1. Discover a camera stream (`tools/stream_camera.py`, run on the robot/camera
+   host) advertising itself on the LAN.
+2. Connect to it and view the live JPEG-over-UDP feed.
+3. Capture calibration images.
 4. Run calibration against the captured images.
-5. Call `SetCameraUndistortParams` with the result.
-6. Clear/reset the saved-frames folder on demand.
+5. Clear/reset the saved-frames folder on demand.
 
-## Building
+## Streaming a camera
 
-Requires the same sibling submodules as RobotGUI: `rhex-api`, `RoboMETU`, and
-`udp-discovery`. CalibGUI is a
-standalone qmake project.
+On the machine with the camera attached:
 
 ```sh
-export INSTALL_PREFIX=$HOME/robot.linux       
-export RHEXAPI_DIR=$INSTALL_PREFIX/rhex-api
-export ROBOMETU_DIR=$INSTALL_PREFIX/RoboMETU
+python3 tools/stream_camera.py --camera 0
+```
+
+See `--help` for options (resolution, fps, JPEG quality, port, advertised name).
+
+## Building CalibGUI
+
+Requires the sibling `udp-discovery` submodule (used for finding camera streams
+on the LAN). CalibGUI is a standalone qmake project.
+
+```sh
+export INSTALL_PREFIX=$HOME/robot.linux
 export UDPD_DIR=$INSTALL_PREFIX/udp-discovery
 qmake CalibGUI.pro
 make

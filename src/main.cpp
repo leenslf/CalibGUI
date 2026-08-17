@@ -1,7 +1,5 @@
 #include <csignal>
 
-#include <gst/gst.h>
-
 #include <QApplication>
 
 #include "MainWindow.h"
@@ -17,15 +15,6 @@ int main(int argc, char *argv[]) {
   QCoreApplication::setOrganizationName("Teknolus");
   QCoreApplication::setOrganizationDomain("teknolus.com");
   QCoreApplication::setApplicationName("CalibGUI");
-
-  gst_init(&argc, &argv);
-  // The qmlglsink plugin must be loaded before any QML that uses GstGLVideoItem is
-  // instantiated, same requirement as RobotGUI/src/main.cpp.
-  GstElement *sink = gst_element_factory_make("qmlglsink", NULL);
-  if (!sink) {
-    fprintf(stderr, "CalibGUI: Could not create qmlglsink element. "
-                     "Is gstreamer1.0-plugins-... (qt/qml) installed?\n");
-  }
 
   app = new QApplication(argc, argv);
 

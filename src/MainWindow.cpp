@@ -23,8 +23,6 @@
 #include <udp_discovery_peer.hpp>
 #include <udp_discovery_ip_port.hpp>
 
-#include <retavis/GstManager.hh>
-
 #include "MainWindow.h"
 #include "CalibWindow.h"
 
@@ -70,7 +68,7 @@ static const QString kIconButtonStyle =
   "QPushButton:hover { background-color: " + kColorHover + "; }"
   "QPushButton:pressed { background-color: " + kColorBorder + "; }";
 
-static const QString kRobotListStyle =
+static const QString kCameraListStyle =
   "QListWidget {"
   "  background-color: " + kColorSurface + "; border: 1px solid " + kColorBorder + ";"
   "  border-radius: 6px; outline: none;"
@@ -86,8 +84,6 @@ static const QString kHeaderLabelStyle =
 
 MainWindow::MainWindow(QWidget *parent) : QWidget(parent) {
   setWindowTitle("CalibGUI");
-
-  _gm = GstManager::getInstance();
 
   _LoadSettings();
 
@@ -105,10 +101,10 @@ MainWindow::MainWindow(QWidget *parent) : QWidget(parent) {
   parameters.set_multicast_group_address(kDiscoveryMulticastAddress);
   parameters.set_can_use_multicast(true);
   parameters.set_can_discover(true);
-  parameters.set_can_be_discovered(true);
+  parameters.set_can_be_discovered(false);
   parameters.set_port(kDiscoveryPort);
   parameters.set_application_id(kDiscoveryApplicationId);
-  if (!_peer->Start(parameters, "discover")) {
+  if (!_peer->Start(parameters, "")) {
     ERRPRINTF("MainWindow: Could not start peer discovery service\n");
     delete _peer;
     _peer = nullptr;
@@ -131,11 +127,6 @@ MainWindow::~MainWindow() {
     delete _peer;
     _peer = nullptr;
   }
-  // Release last: see the acquire comment in the constructor.
-  if (_gm) {
-    _gm->releaseInstance();
-    _gm = nullptr;
-  }
 }
 
 void MainWindow::_initUI() {
@@ -143,7 +134,7 @@ void MainWindow::_initUI() {
   QVBoxLayout *layout = new QVBoxLayout(_connectPage);
 
   QHBoxLayout *headerRow = new QHBoxLayout;
-  QLabel *headerLabel = new QLabel("Bulunan robotlar:");
+  QLabel *headerLabel = new QLabel("Bulunan kameralar:");
   headerLabel->setStyleSheet(kHeaderLabelStyle);
   headerRow->addWidget(headerLabel);
   headerRow->addStretch();
@@ -155,14 +146,14 @@ void MainWindow::_initUI() {
   headerRow->addWidget(_settingsBtn);
   layout->addLayout(headerRow);
 
-  // Sized to content 
-  _robotListWidget = new QListWidget;
-  _robotListWidget->setStyleSheet(kRobotListStyle);
-  _robotListWidget->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
-  connect(_robotListWidget, &QListWidget::currentRowChanged, this,
-          &MainWindow::_handleRobotSelectionChanged);
-  layout->addWidget(_robotListWidget);
-  _UpdateRobotListHeight();
+  // Sized to content
+  _cameraListWidget = new QListWidget;
+  _cameraListWidget->setStyleSheet(kCameraListStyle);
+  _cameraListWidget->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
+  connect(_cameraListWidget, &QListWidget::currentRowChanged, this,
+          &MainWindow::_handleCameraSelectionChanged);
+  layout->addWidget(_cameraListWidget);
+  _UpdateCameraListHeight();
 
   QHBoxLayout *actionRow = new QHBoxLayout;
   actionRow->addStretch();
@@ -182,16 +173,16 @@ void MainWindow::_initUI() {
   layout->addLayout(actionRow);
 }
 
-void MainWindow::_UpdateRobotListHeight() {
+void MainWindow::_UpdateCameraListHeight() {
   const int kMinRows = 1;
   const int kMaxRows = 6;
-  int rows = std::max(kMinRows, std::min(kMaxRows, (int) _robots.size()));
-  int rowHeight = _robotListWidget->sizeHintForRow(0);
-  if (rowHeight <= 0) rowHeight = _robotListWidget->fontMetrics().height() + 20;
-  int frame = 2 * _robotListWidget->frameWidth();
+  int rows = std::max(kMinRows, std::min(kMaxRows, (int) _cameras.size()));
+  int rowHeight = _cameraListWidget->sizeHintForRow(0);
+  if (rowHeight <= 0) rowHeight = _cameraListWidget->fontMetrics().height() + 20;
+  int frame = 2 * _cameraListWidget->frameWidth();
   int height = rows * rowHeight + frame + 4;
-  _robotListWidget->setMinimumHeight(height);
-  _robotListWidget->setMaximumHeight(height);
+  _cameraListWidget->setMinimumHeight(height);
+  _cameraListWidget->setMaximumHeight(height);
 }
 
 void MainWindow::_pollDiscovery() {
@@ -199,61 +190,55 @@ void MainWindow::_pollDiscovery() {
   std::list<udpdiscovery::DiscoveredPeer> discovered = _peer->ListDiscovered();
 
   // CalibGUI only ever shows a short list for a single connection, so it just rebuilds the list on every poll.
-  std::vector<DiscoveredRobot> robots;
+  std::vector<DiscoveredCamera> cameras;
   for (const auto &peer : discovered) {
     std::string data = peer.user_data();
     size_t pos = data.find(':', 0);
     if (pos == std::string::npos) continue;
     std::string name = data.substr(0, pos);
-    size_t pos2 = data.find(':', pos + 1);
-    if (pos2 == std::string::npos) continue;
-    std::string type = data.substr(pos + 1, pos2 - pos - 1);
-    size_t pos3 = data.find(':', pos2 + 1);
-    std::string portstr = data.substr(pos2 + 1, pos3 - pos2 - 1);
+    std::string portstr = data.substr(pos + 1);
 
-    DiscoveredRobot r;
-    r.name = name;
-    r.type = type;
-    r.ip = udpdiscovery::IpToString(peer.ip_port().ip());
+    DiscoveredCamera c;
+    c.name = name;
+    c.ip = udpdiscovery::IpToString(peer.ip_port().ip());
     try {
-      r.port = std::stoi(portstr);
+      c.port = std::stoi(portstr);
     } catch (const std::exception &) {
       continue;
     }
-    robots.push_back(r);
+    cameras.push_back(c);
   }
 
   // Preserve the current selection across a rebuild where possible.
-  int selectedRow = _robotListWidget->currentRow();
-  std::string selectedId = (selectedRow >= 0 && selectedRow < (int) _robots.size())
-    ? _robots[selectedRow].ip + ":" + std::to_string(_robots[selectedRow].port) : "";
+  int selectedRow = _cameraListWidget->currentRow();
+  std::string selectedId = (selectedRow >= 0 && selectedRow < (int) _cameras.size())
+    ? _cameras[selectedRow].ip + ":" + std::to_string(_cameras[selectedRow].port) : "";
 
-  _robots = robots;
-  _robotListWidget->clear();
+  _cameras = cameras;
+  _cameraListWidget->clear();
   int newSelectedRow = -1;
-  for (size_t i = 0; i < _robots.size(); ++i) {
-    const DiscoveredRobot &r = _robots[i];
-    QString label = QString::fromStdString(r.name) + "  ("
-      + QString::fromStdString(r.ip) + ":" + QString::number(r.port) + ")";
-    _robotListWidget->addItem(label);
-    std::string id = r.ip + ":" + std::to_string(r.port);
+  for (size_t i = 0; i < _cameras.size(); ++i) {
+    const DiscoveredCamera &c = _cameras[i];
+    QString label = QString::fromStdString(c.name) + "  ("
+      + QString::fromStdString(c.ip) + ":" + QString::number(c.port) + ")";
+    _cameraListWidget->addItem(label);
+    std::string id = c.ip + ":" + std::to_string(c.port);
     if (id == selectedId) newSelectedRow = (int) i;
   }
-  if (newSelectedRow >= 0) _robotListWidget->setCurrentRow(newSelectedRow);
-  _UpdateRobotListHeight();
+  if (newSelectedRow >= 0) _cameraListWidget->setCurrentRow(newSelectedRow);
+  _UpdateCameraListHeight();
 }
 
-void MainWindow::_handleRobotSelectionChanged() {
-  _connectBtn->setEnabled(_robotListWidget->currentRow() >= 0);
+void MainWindow::_handleCameraSelectionChanged() {
+  _connectBtn->setEnabled(_cameraListWidget->currentRow() >= 0);
 }
 
 void MainWindow::_handleConnect() {
-  int row = _robotListWidget->currentRow();
-  if (row < 0 || row >= (int) _robots.size() || _calibWindow) return;
-  const DiscoveredRobot robot = _robots[row];
+  int row = _cameraListWidget->currentRow();
+  if (row < 0 || row >= (int) _cameras.size() || _calibWindow) return;
+  const DiscoveredCamera camera = _cameras[row];
 
-  // CalibWindow attempts the actual connection itself
-  _calibWindow = new CalibWindow(robot, _settings);
+  _calibWindow = new CalibWindow(camera, _settings);
   connect(_calibWindow, &CalibWindow::closed, this, &MainWindow::_handleCalibWindowClosed);
   _stack->addWidget(_calibWindow);
   _stack->setCurrentWidget(_calibWindow);

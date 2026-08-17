@@ -1,40 +1,37 @@
 #ifndef CAMERAWIDGET_H
 #define CAMERAWIDGET_H
 
-#include <QQuickWidget>
 #include <QLabel>
 #include <QImage>
-#include <gst/gst.h>
 
 class CameraWidget : public QWidget {
   Q_OBJECT
 
 public:
-  CameraWidget(bool qtqml = false, QWidget *parent = nullptr);
-  bool SetQmlGlSink(GstElement *qmlglsink);
-  unsigned long GetWindow();
+  CameraWidget(QWidget *parent = nullptr);
 
   void setState( bool on );
   bool getState() { return !_off->isVisible(); }
   void setStall( bool hwstall, bool netstall );
 
-  // Grabs whatever is currently rendered by the qmlglsink video item, straight
-  // off the GPU. Null image if this widget isn't in qtqml mode or nothing has
-  // been rendered yet.
-  QImage grabFrame();
+  // Displays the given frame and remembers it as the full-resolution frame
+  // returned by grabFrame().
+  void setFrame(const QImage &img);
+
+  // Returns the last frame passed to setFrame(), at full resolution (not the
+  // possibly-scaled pixmap shown on screen). Null image if none received yet.
+  QImage grabFrame() { return _lastFrame; }
 
  protected:
   // Keeps the widget's height matched to its width at a natural 16:9 aspect ratio,
-  // so the video stream fills the box edge-to-edge instead of being letterboxed by
-  // GstGLVideoItem inside a mismatched rect.
+  // so the video stream fills the box edge-to-edge instead of being letterboxed.
   void resizeEvent(QResizeEvent *event) override;
 
  private:
-  QLabel       * _cam = nullptr;
-  QLabel       * _off = nullptr;
-  QLabel       * _stall = nullptr;
-  QQuickWidget * _camqtqml = nullptr;
+  QLabel * _cam = nullptr;
+  QLabel * _off = nullptr;
+  QLabel * _stall = nullptr;
+  QImage   _lastFrame;
 };
 
 #endif /* CAMERAWIDGET_H */
-

@@ -1,21 +1,15 @@
 # Minimal camera-calibration console. Modeled on RobotGUI.pro's environment-variable
 # and library conventions, but trimmed: desktop Linux only (no RG_HARDWARE/RG_LAYOUT
 # matrix, no Android target), and no Qwt dependency (CalibGUI has no Qwt-based
-# widgets).
-QT += core gui widgets quick quickwidgets concurrent
+# widgets). Camera frames arrive as plain JPEG-over-UDP datagrams (see
+# tools/stream_camera.py) rather than through rhex-api, so there's no GStreamer/QML
+# or rhex-api/robometu dependency to configure.
+QT += core gui widgets concurrent network
 
 CONFIG += c++14 link_pkgconfig
 
-ROBOMETU_TEST = $$(ROBOMETU_DIR)
-RHEXAPI_TEST = $$(RHEXAPI_DIR)
 UDPD_TEST = $$(UDPD_DIR)
 
-isEmpty(ROBOMETU_TEST) {
-   error("ROBOMETU_DIR must be defined when invoking qmake")
-}
-isEmpty(RHEXAPI_TEST) {
-   error("RHEXAPI_DIR must be defined when invoking qmake")
-}
 isEmpty(UDPD_TEST) {
    error("UDPD_DIR must be defined when invoking qmake")
 }
@@ -24,8 +18,7 @@ SOURCES += \
   src/main.cpp \
   src/MainWindow.cpp \
   src/CalibWindow.cpp \
-  src/CameraWidget.cpp \
-  src/CamListWidget.cpp
+  src/CameraWidget.cpp
 
 HEADERS += \
   include/config.h \
@@ -34,10 +27,7 @@ HEADERS += \
   include/CalibTypes.h \
   include/MainWindow.h \
   include/CalibWindow.h \
-  include/CameraWidget.h \
-  include/CamListWidget.h
-
-RESOURCES += qml/qml.qrc
+  include/CameraWidget.h
 
 INCLUDEPATH += $$PWD/include
 
@@ -46,17 +36,11 @@ OBJECTS_DIR = build/.obj
 MOC_DIR = build/.moc
 RCC_DIR = build/.rcc
 
-PKGCONFIG += gstreamer-1.0 gstreamer-video-1.0 gstreamer-rtp-1.0 opencv4
-
-PRE_TARGETDEPS += $$(RHEXAPI_DIR)/lib/librhexapi.a
+PKGCONFIG += opencv4
 
 LIBS += \
     -L$$(INSTALL_PREFIX)/lib \
-    -L$$(RHEXAPI_DIR)/lib \
-    -lrhexapi \
-    -lcairo \
-    -lpthread -lrt -lssl -lcrypto -largon2 -ludp-discovery
+    -lpthread -ludp-discovery
 
 INCLUDEPATH += \
-    $$(INSTALL_PREFIX)/include \
-    $$(RHEXAPI_DIR)/include
+    $$(INSTALL_PREFIX)/include
