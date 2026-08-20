@@ -17,17 +17,18 @@ class QLineEdit;
 
 class CalibWindow;
 
-/** Robot IP entry + SSH camera picking. Shown at startup and again
-    whenever a CalibWindow session ends (the user disconnects); constructs a fresh
-    CalibWindow per successful pick and embeds it as a second page in _stack, so the
-    transition stays within a single top-level window instead of swapping to a
-    separate one.
+/** SSH target entry + camera picking. Shown at startup and again whenever a
+    CalibWindow session ends (the user disconnects); constructs a fresh CalibWindow
+    per successful pick and embeds it as a second page in _stack, so the transition
+    stays within a single top-level window instead of swapping to a separate one.
 
     The connect flow itself is a two-page sub-stack (_connectSubStack) inside
-    _connectPage: the user first types the robot's IP (_ipEntryPage), which SSHes in
-    to run `streamserver.sh -l` and list connected cameras; picking one
-    (_cameraPickPage) reuses the same QListWidget/styling the old LAN-discovery flow
-    used. */
+    _connectPage: the user first types a "user@host" SSH target and its password
+    (_ipEntryPage) -- password auth via `sshpass`, since this targets a local test
+    machine rather than a robot with passwordless key auth already provisioned --
+    which SSHes in to run `streamserver.sh -l` and list connected cameras; picking
+    one (_cameraPickPage) reuses the same QListWidget/styling the old LAN-discovery
+    flow used. */
 class MainWindow : public QWidget {
   Q_OBJECT
 
@@ -63,7 +64,8 @@ private:
   QWidget        *_ipEntryPage = nullptr;
   QWidget        *_cameraPickPage = nullptr;
 
-  QLineEdit   *_ipLineEdit = nullptr;
+  QLineEdit   *_sshTargetLineEdit = nullptr;
+  QLineEdit   *_passwordLineEdit = nullptr;
   QPushButton *_ipSubmitBtn = nullptr;
   QLabel      *_ipStatusLabel = nullptr;
 
@@ -74,7 +76,8 @@ private:
   QLabel      *_pickStatusLabel = nullptr;
 
   QProcess *_listProcess = nullptr;
-  std::string _robotIp;
+  std::string _sshTarget;
+  std::string _sshPassword;
   std::vector<RemoteCamera> _cameras;
 
   CalibSettings _settings;

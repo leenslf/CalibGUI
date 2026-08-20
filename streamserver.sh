@@ -81,15 +81,78 @@ if [[ ! -e "$DEVICE" ]]; then
     exit 1
 fi
 
+# --- Self-heal: reclaim the device if a previous instance is still holding it ---
+# Guards against clients that disconnect abnormally (network drop, sleep, crash)
+# and never get a chance to ask us to stop cleanly -- without this, the next
+# stream attempt fails V4L2 buffer allocation against a device an orphaned
+# gst-launch-1.0 still has open. Device-scoped (by basename) so multiple
+# devices/sessions on the same host never collide with each other.
+PIDFILE="/tmp/streamserver-$(basename "$DEVICE").pid"
+
+_reclaim_device() {
+    local pid="$1"
+    [[ -n "$pid" ]] || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+    echo "Found existing streamer (pid $pid) still holding $DEVICE; stopping it..." >&2
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in $(seq 1 25); do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.2
+    done
+    echo "Existing streamer (pid $pid) did not exit in time; sending SIGKILL." >&2
+    kill -KILL "$pid" 2>/dev/null || true
+    sleep 0.2
+}
+
+if [[ -f "$PIDFILE" ]]; then
+    _reclaim_device "$(cat "$PIDFILE" 2>/dev/null || true)"
+    rm -f "$PIDFILE"
+fi
+# Fallback for a missing/stale pidfile (e.g. this script was updated/redeployed
+# after an old instance started): catch anything still matching our own
+# pipeline shape for this exact device.
+_reclaim_device "$(pgrep -f "v4l2src device=$DEVICE " | head -n1 || true)"
+
 echo "Streaming from $DEVICE to $TARGET_IP:$PORT (uncompressed, 2fps)..."
 echo "Press Ctrl+C to stop."
 
-exec gst-launch-1.0 -e \
+trap 'rm -f "$PIDFILE"' EXIT
+
+# Not exec'd (unlike before) so this script can stay around to forward signals
+# to gst-launch-1.0 and clean up the PID file once it actually exits -- both
+# needed so a caller can signal-and-confirm shutdown instead of just closing
+# the SSH connection and hoping the remote side notices (it doesn't reliably).
+#
+# v4l2src is left to negotiate whatever native format/resolution/framerate the
+# camera actually offers (varies a lot between USB cameras -- some only do MJPG,
+# some only support their highest resolution at a lower framerate, etc.); decodebin
+# decodes it if needed (a no-op if it's already raw), and videoconvert/videoscale/
+# videorate normalize it down to the fixed UYVY 640x480@2fps the receiving end
+# expects, regardless of what the camera natively provides.
+gst-launch-1.0 -e \
     v4l2src device="$DEVICE" \
-    ! video/x-raw,format=YUY2,width=640,height=480,framerate=30/1 \
-    ! videorate \
-    ! video/x-raw,framerate=2/1 \
+    ! video/x-raw,format=YUY2,width=640,height=480,framerate=15/1 \
     ! videoconvert \
-    ! video/x-raw,format=UYVY \
+    ! videoscale \
+    ! videorate \
+    ! video/x-raw,format=UYVY,width=640,height=480,framerate=2/1 \
     ! rtpvrawpay \
-    ! udpsink host="$TARGET_IP" port=$PORT
+    ! udpsink host="$TARGET_IP" port=$PORT &
+GST_PID=$!
+echo "$GST_PID" > "$PIDFILE"
+
+# Forward SIGINT/SIGTERM to gst-launch-1.0 so it runs its own -e/EOS -> NULL
+# shutdown (which is what actually issues VIDIOC_STREAMOFF/REQBUFS(0) to release
+# the V4L2 buffer pool) instead of dying uncleanly. Since this script no longer
+# exec's into gst-launch-1.0, both normally receive the signal directly anyway
+# (same process group under the ssh pty); this trap is a safety net for callers
+# that signal only this script's PID (e.g. by pidfile) rather than the pipeline
+# pattern match.
+trap 'kill -TERM "$GST_PID" 2>/dev/null || true' INT TERM
+
+set +e
+wait "$GST_PID"
+GST_EXIT=$?
+set -e
+
+exit "$GST_EXIT"

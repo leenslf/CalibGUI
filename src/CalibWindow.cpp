@@ -14,6 +14,7 @@
 #include <QTimer>
 #include <QShortcut>
 #include <QDateTime>
+#include <QProcessEnvironment>
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrentRun>
 
@@ -402,7 +403,13 @@ void CalibWindow::_handleFrameReady(const QImage &frame) {
 }
 
 bool CalibWindow::_LoadCalibrationForUndistort() {
-  cv::FileStorage fs(_GetCalibrationFilePath(0), cv::FileStorage::READ);
+  std::string path = _GetCalibrationFilePath(0);
+  // Checked separately so the common "no calibration yet" case doesn't make
+  // OpenCV log a scary-looking "Can't open file ... in read mode" error to
+  // stderr for what is normal, expected behavior before the first calibration.
+  if (!QFile::exists(QString::fromStdString(path))) return false;
+
+  cv::FileStorage fs(path, cv::FileStorage::READ);
   if (!fs.isOpened()) return false;
 
   float fx = 0.0f, fy = 0.0f, cx = 0.0f, cy = 0.0f;
@@ -508,27 +515,110 @@ void CalibWindow::_handleLivenessTimer() {
 
 void CalibWindow::_StartStreamProcess() {
   _streamProcess = new QProcess(this);
+  QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+  env.insert("SSHPASS", QString::fromStdString(_camera.sshPassword));
+  _streamProcess->setProcessEnvironment(env);
+
+  // Password auth via sshpass (see MainWindow::_StartListProcess for why); -tt still
+  // requests a remote pty so terminate()/kill() below at least attempts the same
+  // teardown an interrupted interactive SSH session would trigger. This alone isn't
+  // relied on though -- see _StopStreamProcess, which explicitly asks the robot to
+  // stop capturing rather than hoping the SIGHUP propagates through sshpass's own
+  // child ssh process.
   QStringList args {
+    "-e", "ssh",
     "-tt",
-    "-o", "BatchMode=yes",
+    "-o", "BatchMode=no",
     "-o", QString("ConnectTimeout=%1").arg(SSH_CONNECT_TIMEOUT_SECS),
     "-o", "StrictHostKeyChecking=accept-new",
-    QString("%1@%2").arg(SSH_USER, QString::fromStdString(_camera.robotIp)),
+    QString::fromStdString(_camera.sshTarget),
     QString::fromUtf8(STREAMSERVER_PATH), "-d", QString::fromStdString(_camera.device)
   };
   connect(_streamProcess, &QProcess::errorOccurred, this, &CalibWindow::_handleStreamProcessError);
   connect(_streamProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
           this, &CalibWindow::_handleStreamProcessFinished);
-  _streamProcess->start("ssh", args);
+  _streamProcess->start("sshpass", args);
 }
 
 void CalibWindow::_StopStreamProcess() {
   if (!_streamProcess) return;
+
+  // Killing/closing the local SSH connection does NOT reliably terminate the
+  // remote gst-launch-1.0 -- confirmed by testing that even `kill -9` on the
+  // local ssh client leaves it running and still holding the V4L2 device,
+  // which is what causes "Device busy"/buffer-allocation failures on the next
+  // stream attempt. gst-launch-1.0's own SIGTERM/SIGINT -> EOS -> NULL shutdown
+  // (which is what actually issues VIDIOC_STREAMOFF/REQBUFS(0) to release the
+  // V4L2 buffer pool) only runs if it actually receives that signal -- so send
+  // it explicitly over a separate one-shot SSH command and WAIT for the remote
+  // side to confirm exit before touching the streaming session at all, instead
+  // of racing a local terminate()/kill() against it as before.
+  //
+  // Prefers streamserver.sh's PID file (exact match, safe with multiple
+  // devices/sessions on the same host) and falls back to a device-scoped
+  // pattern match if it's missing/stale. Bounded remote wait (5s) with
+  // escalation to SIGKILL so a wedged remote process can't block this
+  // indefinitely, and a bounded local waitForFinished on top of that so a dead
+  // network can't either -- this must never hang the client.
+  QString device = QString::fromStdString(_camera.device);
+  QString remoteKillCmd = QString(R"(
+PIDFILE="/tmp/streamserver-$(basename '%1').pid";
+PID=$(cat "$PIDFILE" 2>/dev/null);
+if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null; then
+  PID=$(pgrep -f "v4l2src device=%1 " | head -n1);
+fi;
+if [ -n "$PID" ]; then
+  kill -TERM "$PID" 2>/dev/null;
+  for i in $(seq 1 25); do kill -0 "$PID" 2>/dev/null || exit 0; sleep 0.2; done;
+  kill -KILL "$PID" 2>/dev/null;
+  sleep 0.2;
+fi
+)").arg(device);
+
+  QProcess killProcess;
+  QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+  env.insert("SSHPASS", QString::fromStdString(_camera.sshPassword));
+  killProcess.setProcessEnvironment(env);
+  killProcess.setProgram("sshpass");
+  killProcess.setArguments({
+    "-e", "ssh",
+    "-o", "BatchMode=no",
+    "-o", QString("ConnectTimeout=%1").arg(SSH_CONNECT_TIMEOUT_SECS),
+    "-o", "StrictHostKeyChecking=accept-new",
+    QString::fromStdString(_camera.sshTarget),
+    remoteKillCmd
+  });
+  killProcess.start();
+  // Remote side can itself wait up to ~5s before escalating to SIGKILL; give
+  // the SSH round-trip room on top of that so a live-but-slow connection isn't
+  // mistaken for a wedged remote process and abandoned early.
+  const int kRemoteKillTimeoutMs = (5 + SSH_CONNECT_TIMEOUT_SECS) * 1000 + 3000;
+  if (!killProcess.waitForFinished(kRemoteKillTimeoutMs)) {
+    ERRPRINTF("[WW] CalibWindow::_StopStreamProcess: remote kill command did not "
+              "finish in time; proceeding with local teardown anyway.\n");
+    killProcess.kill();
+    killProcess.waitForFinished(1000);
+  } else if (killProcess.exitStatus() != QProcess::NormalExit || killProcess.exitCode() != 0) {
+    // exit 255 specifically is ssh(1)'s own code for a transport/auth failure of
+    // *this* connection (couldn't connect, host key, connection reset, etc.) --
+    // it is not the remote script's exit status, which is always 0 here whether
+    // or not it found a PID to kill. Capture stderr/stdout so that distinction
+    // (and the actual ssh diagnostic) is visible instead of just the exit code.
+    QString killErr = QString::fromUtf8(killProcess.readAllStandardError()).trimmed();
+    QString killOut = QString::fromUtf8(killProcess.readAllStandardOutput()).trimmed();
+    ERRPRINTF("[WW] CalibWindow::_StopStreamProcess: remote kill command reported "
+              "failure (exit %d); the remote process may still be running.\n"
+              "  stderr: %s\n  stdout: %s\n",
+              killProcess.exitCode(),
+              killErr.isEmpty() ? "(empty)" : killErr.toUtf8().constData(),
+              killOut.isEmpty() ? "(empty)" : killOut.toUtf8().constData());
+  }
+
+  // The remote gst-launch-1.0/streamserver.sh exiting confirmed above usually
+  // already ends this SSH session on its own; this just cleans up whatever's
+  // left (or forces it, if the session is somehow still up) now that it's
+  // safe to do so.
   if (_streamProcess->state() != QProcess::NotRunning) {
-    // SIGTERM -> local ssh drops -> remote pty hangs up -> SIGHUP to the remote
-    // process group, the same mechanism that stops a remote command when you
-    // Ctrl-C or close an interactive SSH session's terminal (see -tt in
-    // _StartStreamProcess).
     _streamProcess->terminate();
     if (!_streamProcess->waitForFinished(2000)) {
       _streamProcess->kill();
@@ -542,13 +632,32 @@ void CalibWindow::_StopStreamProcess() {
 void CalibWindow::_handleStreamProcessError(QProcess::ProcessError error) {
   if (!_connected) return;
   if (error == QProcess::FailedToStart) {
-    _ShowStatus("HATA: ssh çalıştırılamadı (sistemde kurulu mu?).", true);
+    _ShowStatus("HATA: sshpass çalıştırılamadı (sistemde kurulu mu? "
+                "'sudo apt install sshpass').", true);
   }
 }
 
 void CalibWindow::_handleStreamProcessFinished(int, QProcess::ExitStatus) {
   if (!_connected) return;
-  _ShowStatus("Kamera akışı sonlandı (SSH bağlantısı koptu).", true);
+
+  // -tt allocates a remote pty, which merges the remote command's stdout/stderr onto
+  // one stream -- ssh usually surfaces that as our "stdout" channel, but read both
+  // since that's not guaranteed. This is what actually explains *why* the stream
+  // ended (e.g. gst-launch failing to negotiate caps against a camera that doesn't
+  // support streamserver.sh's fixed YUY2 640x480 request), instead of just "it ended".
+  QString out = QString::fromUtf8(_streamProcess->readAllStandardOutput()).trimmed();
+  QString err = QString::fromUtf8(_streamProcess->readAllStandardError()).trimmed();
+  QString detail = out;
+  if (!err.isEmpty()) detail += (detail.isEmpty() ? QString() : QString("\n")) + err;
+
+  QString msg = "Kamera akışı sonlandı (SSH bağlantısı koptu).";
+  if (!detail.isEmpty()) {
+    QStringList lines = detail.split('\n', Qt::SkipEmptyParts);
+    const int kKeepLines = 6;
+    if (lines.size() > kKeepLines) lines = lines.mid(lines.size() - kKeepLines);
+    msg += "\n" + lines.join('\n');
+  }
+  _ShowStatus(msg.toStdString(), true);
 }
 
 std::string CalibWindow::_GetFramesDirectory() {
