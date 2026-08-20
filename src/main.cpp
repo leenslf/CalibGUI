@@ -2,6 +2,8 @@
 
 #include <QApplication>
 
+#include <gst/gst.h>
+
 #include "MainWindow.h"
 
 static QApplication *app = nullptr;
@@ -12,6 +14,8 @@ static void exit_on_ctrl_c(int) {
 }
 
 int main(int argc, char *argv[]) {
+  gst_init(&argc, &argv);
+
   QCoreApplication::setOrganizationName("Teknolus");
   QCoreApplication::setOrganizationDomain("teknolus.com");
   QCoreApplication::setApplicationName("CalibGUI");
@@ -30,5 +34,6 @@ int main(int argc, char *argv[]) {
   // gone event dispatcher (QBasicTimer::start warning, then a crash).
   delete window;
   delete app;
+  gst_deinit();
   return result;
 }

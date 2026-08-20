@@ -5,23 +5,16 @@
 #include <QListWidget>
 #include <QPushButton>
 #include <QLabel>
+#include <QLineEdit>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
-#include <QMessageBox>
 #include <QFile>
 #include <QDir>
 #include <QCoreApplication>
 #include <QTimer>
-#include <QDialog>
-#include <QDialogButtonBox>
-#include <QFormLayout>
-#include <QSpinBox>
-#include <QDoubleSpinBox>
+#include <QProcess>
 
 #include <opencv2/core.hpp>
-
-#include <udp_discovery_peer.hpp>
-#include <udp_discovery_ip_port.hpp>
 
 #include "MainWindow.h"
 #include "CalibWindow.h"
@@ -30,14 +23,6 @@
 #include "Theme.h"
 #undef DEBUG_LOCAL
 #include "debuglog.h"
-
-// Ported from RobotGUI/src/MainWindow.cpp:132-164
-static const unsigned short kDiscoveryPort = 12021;
-static const uint64_t kDiscoveryApplicationId = 7681412;
-static const unsigned int kDiscoveryMulticastAddress =
-  (224 << 24) + (0 << 16) + (0 << 8) + 123;
-
-static const int kCalibFrameCount = 30;
 
 // ===========================================================================================================
 static const QString kPrimaryButtonStyle =
@@ -80,6 +65,67 @@ static const QString kCameraListStyle =
 static const QString kHeaderLabelStyle =
   "color: " + kColorText + "; font-size: 13pt; font-weight: 600;";
 
+static const QString kStatusLabelStyle =
+  "color: " + kColorTextMuted + "; font-size: 11pt; padding: 4px 2px;";
+
+// ===========================================================================================================
+
+// Extracts the device index from a v4l2 device node path, e.g. "/dev/video0" -> "0".
+// Used as the folder-naming key (Frames/<name>/, Calibrations/<name>/) since it's
+// short and always uniquely identifies which node was picked, unlike the v4l2-ctl
+// camera label (which can be long, spacey, or repeated across robots).
+static std::string DeviceIndexName(const std::string &device) {
+  size_t slash = device.find_last_of('/');
+  std::string base = (slash != std::string::npos) ? device.substr(slash + 1) : device;
+  static const std::string kPrefix = "video";
+  if (base.compare(0, kPrefix.size(), kPrefix) == 0) base = base.substr(kPrefix.size());
+  return base;
+}
+
+// Parses the "Connected cameras:" block of `streamserver.sh -l`'s stdout (i.e.
+// `v4l2-ctl --list-devices`'s own output): groups separated by blank lines, a
+// non-indented header line ending in ':' names the physical camera, followed by one
+// or more indented "/dev/videoN" lines -- only the first device line per group is
+// kept (the capture-capable node).
+static std::vector<RemoteCamera> ParseStreamserverCameraList(
+    const std::string &stdoutText, const std::string &robotIp) {
+  std::vector<RemoteCamera> result;
+  QString text = QString::fromStdString(stdoutText);
+
+  int start = text.indexOf("Connected cameras:");
+  if (start < 0) return result;
+  start += QString("Connected cameras:").length();
+  int end = text.indexOf("Supported formats per device:", start);
+  QString block = (end < 0) ? text.mid(start) : text.mid(start, end - start);
+
+  QString currentLabel;
+  bool haveDeviceForCurrent = false;
+  const QStringList lines = block.split('\n');
+  for (const QString &rawLine : lines) {
+    QString trimmed = rawLine.trimmed();
+    if (trimmed.isEmpty()) {
+      currentLabel.clear();
+      haveDeviceForCurrent = false;
+      continue;
+    }
+    bool indented = rawLine.startsWith(' ') || rawLine.startsWith('\t');
+    if (!indented && trimmed.endsWith(':')) {
+      currentLabel = trimmed.chopped(1).trimmed();
+      haveDeviceForCurrent = false;
+    } else if (indented && trimmed.startsWith("/dev/video") &&
+               !currentLabel.isEmpty() && !haveDeviceForCurrent) {
+      RemoteCamera c;
+      c.robotIp = robotIp;
+      c.label = currentLabel.toStdString();
+      c.device = trimmed.toStdString();
+      c.name = DeviceIndexName(c.device);
+      result.push_back(c);
+      haveDeviceForCurrent = true;
+    }
+  }
+  return result;
+}
+
 // ===========================================================================================================
 
 MainWindow::MainWindow(QWidget *parent) : QWidget(parent) {
@@ -95,25 +141,6 @@ MainWindow::MainWindow(QWidget *parent) : QWidget(parent) {
   _stack->addWidget(_connectPage);
   _stack->setCurrentWidget(_connectPage);
 
-  udpdiscovery::PeerParameters parameters;
-  _peer = new udpdiscovery::Peer;
-  parameters.set_can_use_broadcast(true);
-  parameters.set_multicast_group_address(kDiscoveryMulticastAddress);
-  parameters.set_can_use_multicast(true);
-  parameters.set_can_discover(true);
-  parameters.set_can_be_discovered(false);
-  parameters.set_port(kDiscoveryPort);
-  parameters.set_application_id(kDiscoveryApplicationId);
-  if (!_peer->Start(parameters, "")) {
-    ERRPRINTF("MainWindow: Could not start peer discovery service\n");
-    delete _peer;
-    _peer = nullptr;
-  }
-
-  _discoveryTimer = new QTimer(this);
-  connect(_discoveryTimer, &QTimer::timeout, this, &MainWindow::_pollDiscovery);
-  _discoveryTimer->start(1000);
-
   resize(900, 700);
 }
 
@@ -122,10 +149,10 @@ MainWindow::~MainWindow() {
     delete _calibWindow;
     _calibWindow = nullptr;
   }
-  if (_peer) {
-    _peer->Stop();
-    delete _peer;
-    _peer = nullptr;
+  if (_listProcess) {
+    _listProcess->kill();
+    _listProcess->deleteLater();
+    _listProcess = nullptr;
   }
 }
 
@@ -133,17 +160,70 @@ void MainWindow::_initUI() {
   _connectPage = new QWidget;
   QVBoxLayout *layout = new QVBoxLayout(_connectPage);
 
+  QLabel *headerLabel = new QLabel("CalibGUI");
+  headerLabel->setStyleSheet(kHeaderLabelStyle);
+  layout->addWidget(headerLabel);
+
+  _connectSubStack = new QStackedWidget;
+  layout->addWidget(_connectSubStack);
+
+  _initIpEntryPage();
+  _initCameraPickPage();
+  _connectSubStack->addWidget(_ipEntryPage);
+  _connectSubStack->addWidget(_cameraPickPage);
+  _connectSubStack->setCurrentWidget(_ipEntryPage);
+}
+
+void MainWindow::_initIpEntryPage() {
+  _ipEntryPage = new QWidget;
+  QVBoxLayout *layout = new QVBoxLayout(_ipEntryPage);
+
+  QLabel *label = new QLabel("Robot IP adresi:");
+  label->setStyleSheet(kHeaderLabelStyle);
+  layout->addWidget(label);
+
+  QHBoxLayout *ipRow = new QHBoxLayout;
+  _ipLineEdit = new QLineEdit;
+  _ipLineEdit->setPlaceholderText("ör. 192.168.1.50");
+  connect(_ipLineEdit, &QLineEdit::returnPressed, this, &MainWindow::_handleIpSubmit);
+  ipRow->addWidget(_ipLineEdit);
+  _ipSubmitBtn = new QPushButton("Kameraları Listele");
+  _ipSubmitBtn->setStyleSheet(kPrimaryButtonStyle);
+  connect(_ipSubmitBtn, &QPushButton::released, this, &MainWindow::_handleIpSubmit);
+  ipRow->addWidget(_ipSubmitBtn);
+  layout->addLayout(ipRow);
+
+  _ipStatusLabel = new QLabel;
+  _ipStatusLabel->setWordWrap(true);
+  _ipStatusLabel->setStyleSheet(kStatusLabelStyle);
+  layout->addWidget(_ipStatusLabel);
+  layout->addStretch();
+
+  QHBoxLayout *actionRow = new QHBoxLayout;
+  actionRow->addStretch();
+  QPushButton *exitBtn = new QPushButton("Çıkış");
+  exitBtn->setStyleSheet(kSecondaryButtonStyle);
+  exitBtn->setMinimumWidth(90);
+  connect(exitBtn, &QPushButton::released, this, &QWidget::close);
+  actionRow->addWidget(exitBtn);
+  layout->addLayout(actionRow);
+}
+
+void MainWindow::_initCameraPickPage() {
+  _cameraPickPage = new QWidget;
+  QVBoxLayout *layout = new QVBoxLayout(_cameraPickPage);
+
   QHBoxLayout *headerRow = new QHBoxLayout;
   QLabel *headerLabel = new QLabel("Bulunan kameralar:");
   headerLabel->setStyleSheet(kHeaderLabelStyle);
   headerRow->addWidget(headerLabel);
   headerRow->addStretch();
-  _settingsBtn = new QPushButton(QString::fromUtf8("\xE2\x9A\x99"));
-  _settingsBtn->setToolTip("Kalibrasyon Ayarları");
-  _settingsBtn->setFixedSize(36, 36);
-  _settingsBtn->setStyleSheet(kIconButtonStyle);
-  connect(_settingsBtn, &QPushButton::released, this, &MainWindow::_handleSettingsClicked);
-  headerRow->addWidget(_settingsBtn);
+  _refreshBtn = new QPushButton(QString::fromUtf8("\xE2\x86\xBB"));
+  _refreshBtn->setToolTip("Kameraları Yenile");
+  _refreshBtn->setFixedSize(36, 36);
+  _refreshBtn->setStyleSheet(kIconButtonStyle);
+  connect(_refreshBtn, &QPushButton::released, this, &MainWindow::_handleRefreshCameras);
+  headerRow->addWidget(_refreshBtn);
   layout->addLayout(headerRow);
 
   // Sized to content
@@ -153,9 +233,17 @@ void MainWindow::_initUI() {
   connect(_cameraListWidget, &QListWidget::currentRowChanged, this,
           &MainWindow::_handleCameraSelectionChanged);
   layout->addWidget(_cameraListWidget);
-  _UpdateCameraListHeight();
+
+  _pickStatusLabel = new QLabel;
+  _pickStatusLabel->setWordWrap(true);
+  _pickStatusLabel->setStyleSheet(kStatusLabelStyle);
+  layout->addWidget(_pickStatusLabel);
 
   QHBoxLayout *actionRow = new QHBoxLayout;
+  _backBtn = new QPushButton("Farklı Robot");
+  _backBtn->setStyleSheet(kSecondaryButtonStyle);
+  connect(_backBtn, &QPushButton::released, this, &MainWindow::_handleBackToIpEntry);
+  actionRow->addWidget(_backBtn);
   actionRow->addStretch();
   _connectBtn = new QPushButton("Bağlan");
   _connectBtn->setEnabled(false);
@@ -185,58 +273,96 @@ void MainWindow::_UpdateCameraListHeight() {
   _cameraListWidget->setMaximumHeight(height);
 }
 
-void MainWindow::_pollDiscovery() {
-  if (!_peer) return;
-  std::list<udpdiscovery::DiscoveredPeer> discovered = _peer->ListDiscovered();
-
-  // CalibGUI only ever shows a short list for a single connection, so it just rebuilds the list on every poll.
-  std::vector<DiscoveredCamera> cameras;
-  for (const auto &peer : discovered) {
-    std::string data = peer.user_data();
-    size_t pos = data.find(':', 0);
-    if (pos == std::string::npos) continue;
-    std::string name = data.substr(0, pos);
-    std::string portstr = data.substr(pos + 1);
-
-    DiscoveredCamera c;
-    c.name = name;
-    c.ip = udpdiscovery::IpToString(peer.ip_port().ip());
-    try {
-      c.port = std::stoi(portstr);
-    } catch (const std::exception &) {
-      continue;
-    }
-    cameras.push_back(c);
-  }
-
-  // Preserve the current selection across a rebuild where possible.
-  int selectedRow = _cameraListWidget->currentRow();
-  std::string selectedId = (selectedRow >= 0 && selectedRow < (int) _cameras.size())
-    ? _cameras[selectedRow].ip + ":" + std::to_string(_cameras[selectedRow].port) : "";
-
-  _cameras = cameras;
-  _cameraListWidget->clear();
-  int newSelectedRow = -1;
-  for (size_t i = 0; i < _cameras.size(); ++i) {
-    const DiscoveredCamera &c = _cameras[i];
-    QString label = QString::fromStdString(c.name) + "  ("
-      + QString::fromStdString(c.ip) + ":" + QString::number(c.port) + ")";
-    _cameraListWidget->addItem(label);
-    std::string id = c.ip + ":" + std::to_string(c.port);
-    if (id == selectedId) newSelectedRow = (int) i;
-  }
-  if (newSelectedRow >= 0) _cameraListWidget->setCurrentRow(newSelectedRow);
-  _UpdateCameraListHeight();
-}
-
 void MainWindow::_handleCameraSelectionChanged() {
   _connectBtn->setEnabled(_cameraListWidget->currentRow() >= 0);
+}
+
+void MainWindow::_handleIpSubmit() {
+  std::string ip = _ipLineEdit->text().trimmed().toStdString();
+  if (ip.empty() || _listProcess) return;
+  _robotIp = ip;
+  _StartListProcess();
+}
+
+void MainWindow::_handleRefreshCameras() {
+  if (_robotIp.empty() || _listProcess) return;
+  _StartListProcess();
+}
+
+void MainWindow::_StartListProcess() {
+  _ipSubmitBtn->setEnabled(false);
+  _refreshBtn->setEnabled(false);
+  _connectBtn->setEnabled(false);
+  _cameras.clear();
+  _cameraListWidget->clear();
+  _connectSubStack->setCurrentWidget(_cameraPickPage);
+  _pickStatusLabel->setText("Kameralar listeleniyor...");
+  _UpdateCameraListHeight();
+
+  _listProcess = new QProcess(this);
+  QStringList args {
+    "-o", "BatchMode=yes",
+    "-o", QString("ConnectTimeout=%1").arg(SSH_CONNECT_TIMEOUT_SECS),
+    "-o", "StrictHostKeyChecking=accept-new",
+    QString("%1@%2").arg(SSH_USER, QString::fromStdString(_robotIp)),
+    QString::fromUtf8(STREAMSERVER_PATH), "-l"
+  };
+  connect(_listProcess, &QProcess::errorOccurred, this, &MainWindow::_handleListProcessError);
+  connect(_listProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+          this, &MainWindow::_handleListProcessFinished);
+  _listProcess->start("ssh", args);
+}
+
+void MainWindow::_handleListProcessFinished(int exitCode, QProcess::ExitStatus status) {
+  QByteArray out = _listProcess->readAllStandardOutput();
+  QByteArray err = _listProcess->readAllStandardError();
+  _listProcess->deleteLater();
+  _listProcess = nullptr;
+  _ipSubmitBtn->setEnabled(true);
+  _refreshBtn->setEnabled(true);
+
+  if (status != QProcess::NormalExit || exitCode != 0) {
+    _pickStatusLabel->setText(QString("Robota bağlanılamadı: %1").arg(
+      err.isEmpty() ? QString("bilinmeyen hata") : QString::fromUtf8(err).trimmed()));
+    return;
+  }
+
+  _cameras = ParseStreamserverCameraList(out.toStdString(), _robotIp);
+  for (const RemoteCamera &c : _cameras) {
+    _cameraListWidget->addItem(QString::fromStdString(c.label) + "  ("
+      + QString::fromStdString(c.device) + ")");
+  }
+  _UpdateCameraListHeight();
+  _pickStatusLabel->setText(
+    _cameras.empty() ? "Bu robotta bağlı kamera bulunamadı." : "");
+}
+
+void MainWindow::_handleListProcessError(QProcess::ProcessError error) {
+  if (!_listProcess || error != QProcess::FailedToStart) return;
+  _pickStatusLabel->setText("ssh çalıştırılamadı (sistemde kurulu mu?).");
+  _listProcess->deleteLater();
+  _listProcess = nullptr;
+  _ipSubmitBtn->setEnabled(true);
+  _refreshBtn->setEnabled(true);
+}
+
+void MainWindow::_handleBackToIpEntry() {
+  if (_listProcess) {
+    _listProcess->kill();
+    _listProcess->deleteLater();
+    _listProcess = nullptr;
+  }
+  _cameras.clear();
+  _cameraListWidget->clear();
+  _connectBtn->setEnabled(false);
+  _pickStatusLabel->clear();
+  _connectSubStack->setCurrentWidget(_ipEntryPage);
 }
 
 void MainWindow::_handleConnect() {
   int row = _cameraListWidget->currentRow();
   if (row < 0 || row >= (int) _cameras.size() || _calibWindow) return;
-  const DiscoveredCamera camera = _cameras[row];
+  const RemoteCamera camera = _cameras[row];
 
   _calibWindow = new CalibWindow(camera, _settings);
   connect(_calibWindow, &CalibWindow::closed, this, &MainWindow::_handleCalibWindowClosed);
@@ -248,29 +374,12 @@ void MainWindow::_handleConnect() {
 
 void MainWindow::_handleCalibWindowClosed() {
   if (_calibWindow) {
+    _connectSubStack->setCurrentWidget(_cameraPickPage);
     _stack->setCurrentWidget(_connectPage);
     _stack->removeWidget(_calibWindow);
     _calibWindow->deleteLater();
     _calibWindow = nullptr;
   }
-}
-
-std::string MainWindow::_GetFramesDirectory() {
-  QDir dir(QCoreApplication::applicationDirPath());
-  dir.cdUp();
-  dir.mkpath("Frames");
-  return dir.filePath("Frames/").toStdString();
-}
-
-int MainWindow::_ClearSavedFrames() {
-  std::string path = _GetFramesDirectory();
-  std::vector<cv::String> filenames;
-  cv::glob(path + "*.png", filenames, true);
-  int removed = 0;
-  for (const cv::String &fn : filenames) {
-    if (QFile::remove(QString::fromStdString(fn))) ++removed;
-  }
-  return removed;
 }
 
 std::string MainWindow::_ConfigFilePath() {
@@ -300,123 +409,4 @@ void MainWindow::_LoadSettings() {
   readFloat("marker_length_m", _settings.markerLengthM);
   readInt("min_valid_frames", _settings.minValidFrames);
   fs.release();
-}
-
-void MainWindow::_SaveSettings() {
-  cv::FileStorage fs(_ConfigFilePath(), cv::FileStorage::WRITE);
-  if (!fs.isOpened()) {
-    ERRPRINTF("[EE] MainWindow::_SaveSettings: could not open %s for writing\n",
-              _ConfigFilePath().c_str());
-    return;
-  }
-  fs << "squares_x" << _settings.squaresX;
-  fs << "squares_y" << _settings.squaresY;
-  fs << "square_length_m" << _settings.squareLengthM;
-  fs << "marker_length_m" << _settings.markerLengthM;
-  fs << "min_valid_frames" << _settings.minValidFrames;
-  fs.release();
-}
-
-void MainWindow::_handleSettingsClicked() {
-  QDialog dialog(this);
-  dialog.setWindowTitle("Kalibrasyon Ayarları");
-
-  QFormLayout *form = new QFormLayout;
-
-  QSpinBox *squaresXSpin = new QSpinBox;
-  squaresXSpin->setRange(2, 20);
-  squaresXSpin->setValue(_settings.squaresX);
-  squaresXSpin->setToolTip("Kalibrasyon tahtasındaki kare sütunu sayısı.");
-  form->addRow("Tahta genişliği (kare):", squaresXSpin);
-
-  QSpinBox *squaresYSpin = new QSpinBox;
-  squaresYSpin->setRange(2, 20);
-  squaresYSpin->setValue(_settings.squaresY);
-  squaresYSpin->setToolTip("Kalibrasyon tahtasındaki kare satırı sayısı.");
-  form->addRow("Tahta yüksekliği (kare):", squaresYSpin);
-
-  QDoubleSpinBox *squareLenSpin = new QDoubleSpinBox;
-  squareLenSpin->setRange(1.0, 500.0);
-  squareLenSpin->setDecimals(1);
-  squareLenSpin->setSuffix(" mm");
-  squareLenSpin->setValue(_settings.squareLengthM * 1000.0);
-  squareLenSpin->setToolTip("Tahtadaki her bir satranç karesinin kenar uzunluğu.");
-  form->addRow("Kare boyutu:", squareLenSpin);
-
-  QDoubleSpinBox *markerLenSpin = new QDoubleSpinBox;
-  markerLenSpin->setRange(1.0, 500.0);
-  markerLenSpin->setDecimals(1);
-  markerLenSpin->setSuffix(" mm");
-  markerLenSpin->setValue(_settings.markerLengthM * 1000.0);
-  markerLenSpin->setToolTip("Karelerin içindeki ArUco marker'ların kenar uzunluğu "
-                             "(kare boyutundan küçük olmalıdır).");
-  form->addRow("Marker boyutu:", markerLenSpin);
-
-  QSpinBox *minValidSpin = new QSpinBox;
-  minValidSpin->setRange(1, kCalibFrameCount);
-  minValidSpin->setValue(_settings.minValidFrames);
-  minValidSpin->setToolTip("Bir karenin kalibrasyonda kullanılması için üzerinde "
-                            "tespit edilmesi gereken minimum köşe sayısı.");
-  form->addRow("Min. geçerli kare sayısı:", minValidSpin);
-
-  QVBoxLayout *dialogLayout = new QVBoxLayout(&dialog);
-  dialogLayout->addLayout(form);
-
-  QPushButton *resetBtn = new QPushButton("Varsayılana Dön");
-  QDialogButtonBox *buttons =
-    new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
-  QHBoxLayout *dialogBtnRow = new QHBoxLayout;
-  dialogBtnRow->addWidget(resetBtn);
-  dialogBtnRow->addStretch();
-  dialogBtnRow->addWidget(buttons);
-  dialogLayout->addLayout(dialogBtnRow);
-
-  connect(resetBtn, &QPushButton::released, [&]() {
-    CalibSettings d;
-    squaresXSpin->setValue(d.squaresX);
-    squaresYSpin->setValue(d.squaresY);
-    squareLenSpin->setValue(d.squareLengthM * 1000.0);
-    markerLenSpin->setValue(d.markerLengthM * 1000.0);
-    minValidSpin->setValue(d.minValidFrames);
-  });
-  connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-  connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-
-  if (dialog.exec() != QDialog::Accepted) return;
-
-  if (markerLenSpin->value() >= squareLenSpin->value()) {
-    QMessageBox::warning(this, "Geçersiz Ayar",
-                          "Marker boyutu, kare boyutundan küçük olmalıdır.");
-    return;
-  }
-  bool boardChanged =
-    squaresXSpin->value() != _settings.squaresX ||
-    squaresYSpin->value() != _settings.squaresY ||
-    !qFuzzyCompare(squareLenSpin->value(), _settings.squareLengthM * 1000.0) ||
-    !qFuzzyCompare(markerLenSpin->value(), _settings.markerLengthM * 1000.0);
-
-  if (boardChanged) {
-    std::vector<cv::String> existingFrames;
-    cv::glob(_GetFramesDirectory() + "*.png", existingFrames, true);
-    int savedFrameCount = (int) existingFrames.size();
-
-    if (savedFrameCount > 0) {
-      QMessageBox::StandardButton reply = QMessageBox::question(
-        this, "Tahta Ayarları Değişti",
-        QString("Şu anda %1 kare kaydedilmiş durumda. Tahta ayarlarını değiştirmek "
-                "bu kareleri geçersiz kılar.\nKareler silinip yeni ayarlar uygulansın mı?")
-          .arg(savedFrameCount),
-        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
-      if (reply != QMessageBox::Yes) return;
-      _ClearSavedFrames();
-    }
-  }
-
-  _settings.squaresX = squaresXSpin->value();
-  _settings.squaresY = squaresYSpin->value();
-  _settings.squareLengthM = (float) (squareLenSpin->value() / 1000.0);
-  _settings.markerLengthM = (float) (markerLenSpin->value() / 1000.0);
-  _settings.minValidFrames = minValidSpin->value();
-
-  _SaveSettings();
 }

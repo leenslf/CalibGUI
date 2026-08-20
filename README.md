@@ -2,31 +2,33 @@
 
 Minimal Qt console for camera calibration. Scoped to just:
 
-1. Discover a camera stream (`tools/stream_camera.py`, run on the robot/camera
-   host) advertising itself on the LAN.
-2. Connect to it and view the live JPEG-over-UDP feed.
+1. Enter a robot's IP address; CalibGUI SSHes in (`root`, passwordless key auth) and
+   runs `streamserver.sh -l` to list its connected cameras.
+2. Pick a camera; CalibGUI SSHes in again to run `streamserver.sh -d <device>`, and
+   receives the resulting RTP raw-video stream locally via GStreamer.
 3. Capture calibration images.
 4. Run calibration against the captured images.
 5. Clear/reset the saved-frames folder on demand.
 
 ## Streaming a camera
 
-On the machine with the camera attached:
+`streamserver.sh` must already be present at `~/streamserver.sh` on the robot. It
+streams uncompressed video from a v4l2 device to whichever machine ran it over SSH:
 
 ```sh
-python3 tools/stream_camera.py --camera 0
+ssh root@<robot-ip> ~/streamserver.sh -l          # list connected cameras
+ssh root@<robot-ip> ~/streamserver.sh -d /dev/video0
 ```
 
-See `--help` for options (resolution, fps, JPEG quality, port, advertised name).
+CalibGUI runs both of these itself (from the IP-entry and camera-picker steps) --
+there's no need to run them by hand except to debug connectivity.
 
 ## Building CalibGUI
 
-Requires the sibling `udp-discovery` submodule (used for finding camera streams
-on the LAN). CalibGUI is a standalone qmake project.
+CalibGUI is a standalone qmake project. Requires GStreamer 1.0 (`gstreamer-1.0`,
+`gstreamer-video-1.0` via pkg-config) in addition to Qt and OpenCV.
 
 ```sh
-export INSTALL_PREFIX=$HOME/robot.linux
-export UDPD_DIR=$INSTALL_PREFIX/udp-discovery
 qmake CalibGUI.pro
 make
 ```

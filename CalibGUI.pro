@@ -1,18 +1,13 @@
 # Minimal camera-calibration console. Modeled on RobotGUI.pro's environment-variable
 # and library conventions, but trimmed: desktop Linux only (no RG_HARDWARE/RG_LAYOUT
 # matrix, no Android target), and no Qwt dependency (CalibGUI has no Qwt-based
-# widgets). Camera frames arrive as plain JPEG-over-UDP datagrams (see
-# tools/stream_camera.py) rather than through rhex-api, so there's no GStreamer/QML
-# or rhex-api/robometu dependency to configure.
+# widgets). Camera frames arrive as an uncompressed RTP raw-video stream (see
+# streamserver.sh, run on the robot over SSH), decoded locally via a GStreamer
+# udpsrc/appsink pipeline (see CalibWindow) -- no QML/qmlglsink and no
+# rhex-api/robometu dependency, unlike RobotGUI's video paths.
 QT += core gui widgets concurrent network
 
 CONFIG += c++14 link_pkgconfig
-
-UDPD_TEST = $$(UDPD_DIR)
-
-isEmpty(UDPD_TEST) {
-   error("UDPD_DIR must be defined when invoking qmake")
-}
 
 SOURCES += \
   src/main.cpp \
@@ -24,7 +19,6 @@ HEADERS += \
   include/config.h \
   include/debuglog.h \
   include/Theme.h \
-  include/CalibTypes.h \
   include/MainWindow.h \
   include/CalibWindow.h \
   include/CameraWidget.h
@@ -36,11 +30,6 @@ OBJECTS_DIR = build/.obj
 MOC_DIR = build/.moc
 RCC_DIR = build/.rcc
 
-PKGCONFIG += opencv4
+PKGCONFIG += opencv4 gstreamer-1.0 gstreamer-video-1.0
 
-LIBS += \
-    -L$$(INSTALL_PREFIX)/lib \
-    -lpthread -ludp-discovery
-
-INCLUDEPATH += \
-    $$(INSTALL_PREFIX)/include
+LIBS += -lpthread
