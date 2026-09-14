@@ -1,5 +1,4 @@
 #include <array>
-#include <cctype>
 #include <string>
 
 #include <QApplication>
@@ -7,197 +6,33 @@
 #include <QLabel>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QFrame>
 #include <QMessageBox>
 #include <QFile>
+#include <QFileInfo>
 #include <QDir>
 #include <QCoreApplication>
 #include <QTimer>
 #include <QShortcut>
-#include <QDateTime>
-#include <QProcessEnvironment>
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrentRun>
 
-#include <gst/video/video.h>
-
 #include <opencv2/core.hpp>
-#include <opencv2/imgcodecs.hpp>
 #include <opencv2/calib3d.hpp>
-#include <opencv2/aruco.hpp>
-#include <opencv2/aruco/charuco.hpp>
 
 #include "CalibWindow.h"
+#include "CalibTools.h"
 #include "CameraWidget.h"
+#include "RemoteStreamSession.h"
+#include "SshProcess.h"
 
 #include "config.h"
 #include "Theme.h"
 #undef DEBUG_LOCAL
 #include "debuglog.h"
 
-static const int kCalibFrameCount = 30;
-
-static const char *kFrameExtensions[] = { "*.png", "*.jpg", "*.jpeg" };
-
-// How long without a received frame before we consider the stream unreachable.
-static const qint64 kLivenessTimeoutMs = 4000;
-
-// Bus-message poll interval, mirroring RoboMETU's GstManager::checkMessages pattern
-// (a plain QTimer poll rather than a GLib main loop).
-static const int kBusPollIntervalMs = 100;
-static const int kLivenessCheckIntervalMs = 1000;
-
-static void GlobFrameFiles(const std::string &dirPath, std::vector<cv::String> *filenames) {
-  filenames->clear();
-  for (const char *ext : kFrameExtensions) {
-    std::vector<cv::String> matches;
-    cv::glob(dirPath + ext, matches, false);
-    filenames->insert(filenames->end(), matches.begin(), matches.end());
-  }
-}
-
-static std::string SanitizeFolderName(const std::string &name) {
-  std::string out;
-  for (char c : name) {
-    out += (isalnum((unsigned char) c) || c == '-' || c == '_') ? c : '_';
-  }
-  return out.empty() ? "kamera" : out;
-}
-
-// ===========================================================================================================
-static const QString kPrimaryButtonStyle =
-  "QPushButton {"
-  "  background-color: " + kColorAccent + "; color: white; border: none;"
-  "  border-radius: 6px; padding: 10px 28px; font-weight: bold; font-size: 14px;"
-  "}"
-  "QPushButton:hover:!disabled { background-color: " + kColorAccentHover + "; }"
-  "QPushButton:pressed { background-color: " + kColorAccentPressed + "; }"
-  "QPushButton:disabled { background-color: " + kColorAccentMuted + "; color: #eef2fb; }";
-
-static const QString kSecondaryButtonStyle =
-  "QPushButton {"
-  "  background-color: transparent; color: " + kColorTextMuted + ";"
-  "  border: 1px solid " + kColorBorder + "; border-radius: 6px;"
-  "  padding: 6px 20px; font-size: 13px;"
-  "}"
-  "QPushButton:hover { background-color: " + kColorHover + "; }"
-  "QPushButton:pressed { background-color: " + kColorBorder + "; }";
-
-static const QString kDetailLabelStyle =
-  "color: " + kColorTextMuted + "; font-size: 11pt; padding: 4px 2px;";
-
-// Checkable button: looks like kSecondaryButtonStyle unchecked, accent-filled when
-// checked (undistort preview on), and greyed out when disabled (no calibration file).
-static const QString kToggleButtonStyle =
-  "QPushButton {"
-  "  background-color: transparent; color: " + kColorTextMuted + ";"
-  "  border: 1px solid " + kColorBorder + "; border-radius: 6px;"
-  "  padding: 6px 20px; font-size: 13px;"
-  "}"
-  "QPushButton:hover:!disabled { background-color: " + kColorHover + "; }"
-  "QPushButton:checked { background-color: " + kColorAccent + "; color: white; border: none; }"
-  "QPushButton:checked:hover { background-color: " + kColorAccentHover + "; }"
-  "QPushButton:disabled { color: " + kColorBorder + "; }";
-
-// Small circular "i" info button (fixed 22x22, border-radius half that => perfect circle).
-static const QString kInfoButtonStyle =
-  "QPushButton {"
-  "  background-color: " + kColorAccent + "; color: white; border: none;"
-  "  border-radius: 11px; font-weight: bold; font-size: 12px;"
-  "}"
-  "QPushButton:hover { background-color: " + kColorAccentHover + "; }"
-  "QPushButton:pressed { background-color: " + kColorAccentPressed + "; }";
-
-// ===========================================================================================================
-
-struct CalibrationResult {
-  bool    success = false;
-  QString errorMessage;
-  float   fx = 0.0f;
-  float   fy = 0.0f;
-  float   cx = 0.0f;
-  float   cy = 0.0f;
-  cv::Mat distCoeffs;
-  std::vector<float> perViewErrors;
-};
-
-// Runs entirely on a QtConcurrent worker thread.
-static CalibrationResult _RunCalibration(std::string path, CalibSettings settings) {
-  CalibrationResult result;
-
-  std::vector<cv::String> filenames;
-  GlobFrameFiles(path, &filenames);
-
-  if ((int) filenames.size() < kCalibFrameCount) {
-    result.errorMessage = QString("HATA: Kalibrasyon için yeterli kare yok (%1 / %2).")
-      .arg((int) filenames.size()).arg(kCalibFrameCount);
-    return result;
-  }
-
-  cv::Ptr<cv::aruco::Dictionary> dictionary =
-    cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50);
-  cv::Ptr<cv::aruco::CharucoBoard> board = cv::aruco::CharucoBoard::create(
-    settings.squaresX, settings.squaresY,
-    settings.squareLengthM, settings.markerLengthM, dictionary);
-
-  std::vector<std::vector<cv::Point2f>> allCharucoCorners;
-  std::vector<std::vector<int>> allCharucoIds;
-  cv::Size imageSize;
-
-  for (const cv::String &fn : filenames) {
-    cv::Mat image = cv::imread(fn);
-    if (image.empty()) continue;
-    imageSize = image.size();
-
-    std::vector<int> markerIds;
-    std::vector<std::vector<cv::Point2f>> markerCorners;
-    cv::aruco::detectMarkers(image, dictionary, markerCorners, markerIds);
-    if (markerIds.empty()) continue;
-
-    std::vector<cv::Point2f> charucoCorners;
-    std::vector<int> charucoIds;
-    cv::aruco::interpolateCornersCharuco(markerCorners, markerIds, image, board,
-                                          charucoCorners, charucoIds);
-    if ((int) charucoIds.size() < settings.minValidFrames) continue;
-
-    allCharucoCorners.push_back(charucoCorners);
-    allCharucoIds.push_back(charucoIds);
-  }
-
-  if ((int) allCharucoCorners.size() < settings.minValidFrames) {
-    result.errorMessage = "HATA: Kalibrasyon tahtası yeterli sayıda karede tespit edilemedi.";
-    return result;
-  }
-
-  std::vector<cv::Mat> rvecs, tvecs;
-  cv::Mat cameraMatrix;
-  cv::Mat stdDeviationsIntrinsics, stdDeviationsExtrinsics, perViewErrors;
-  try {
-    cv::aruco::calibrateCameraCharuco(
-      allCharucoCorners, allCharucoIds, board, imageSize,
-      cameraMatrix, result.distCoeffs, rvecs, tvecs,
-      stdDeviationsIntrinsics, stdDeviationsExtrinsics, perViewErrors);
-  } catch (const cv::Exception &e) {
-    ERRPRINTF("[EE] CalibWindow::_RunCalibration: %s\n", e.what());
-    result.errorMessage = "HATA: Kalibrasyon başarısız oldu.";
-    return result;
-  }
-  result.fx = (float) cameraMatrix.at<double>(0, 0);
-  result.fy = (float) cameraMatrix.at<double>(1, 1);
-  result.cx = (float) cameraMatrix.at<double>(0, 2);
-  result.cy = (float) cameraMatrix.at<double>(1, 2);
-
-  result.perViewErrors.reserve(perViewErrors.total());
-  for (int i = 0; i < (int) perViewErrors.total(); ++i) {
-    result.perViewErrors.push_back((float) perViewErrors.at<double>(i));
-  }
-
-  result.success = true;
-  return result;
-}
-
-CalibWindow::CalibWindow(const RemoteCamera &camera, const CalibSettings &settings,
-                          QWidget *parent)
-  : QWidget(parent), _camera(camera), _settings(settings) {
+CalibWindow::CalibWindow(const RemoteCamera &camera, QWidget *parent)
+  : QWidget(parent), _camera(camera) {
   _layout = new QVBoxLayout(this);
 
   _connectingLabel = new QLabel("Bağlanıyor...");
@@ -210,50 +45,62 @@ void CalibWindow::start() {
   delete _connectingLabel;
   _connectingLabel = nullptr;
   _initCalibUI(_layout);
-  _undistortBtn->setEnabled(_LoadCalibrationForUndistort());
+  bool hasCalib = _LoadCalibrationForUndistort();
+  _undistortBtn->setEnabled(hasCalib);
+  _pushUndistortBtn->setEnabled(hasCalib);
 
-  _connected = true;
-
-  _StartReceivePipeline();
-
-  _busTimer = new QTimer(this);
-  connect(_busTimer, &QTimer::timeout, this, &CalibWindow::_handleGstBusTimer);
-  _busTimer->start(kBusPollIntervalMs);
-
-  _livenessTimer = new QTimer(this);
-  connect(_livenessTimer, &QTimer::timeout, this, &CalibWindow::_handleLivenessTimer);
-  _livenessTimer->start(kLivenessCheckIntervalMs);
-
-  _StartStreamProcess();
+  _session = new RemoteStreamSession(_camera, this);
+  connect(_session, &RemoteStreamSession::frameReady, this, &CalibWindow::_handleFrameReady);
+  connect(_session, &RemoteStreamSession::statusMessage, this, &CalibWindow::_handleSessionStatus);
+  _session->start();
 }
 
 CalibWindow::~CalibWindow() {
   // Wait out any background calibration before tearing down.
   if (_calibWatcher && _calibWatcher->isRunning()) _calibWatcher->waitForFinished();
-  _StopStreamProcess();
-  _StopReceivePipeline();
+  delete _session;
+  _session = nullptr;
 }
 
 void CalibWindow::_initCalibUI(QVBoxLayout *layout) {
   QHBoxLayout *topBar = new QHBoxLayout;
+  topBar->setContentsMargins(0, 2, 0, 2);
+  topBar->setSpacing(8);
+
   _disconnectBtn = new QPushButton("Bağlantıyı Kes");
-  _disconnectBtn->setStyleSheet(kSecondaryButtonStyle);
+  _disconnectBtn->setStyleSheet(kCompactButtonStyle);
   connect(_disconnectBtn, &QPushButton::released, this, &CalibWindow::_handleDisconnect);
   topBar->addWidget(_disconnectBtn);
 
   _undistortBtn = new QPushButton("Distorsiyonu Düzelt");
   _undistortBtn->setCheckable(true);
-  _undistortBtn->setStyleSheet(kToggleButtonStyle);
+  _undistortBtn->setStyleSheet(kCompactToggleButtonStyle);
   _undistortBtn->setToolTip("Bu kameranın kayıtlı kalibrasyon dosyasını kullanarak "
                              "görüntüyü distorsiyondan arındır.");
   _undistortBtn->setEnabled(false);
   connect(_undistortBtn, &QPushButton::toggled, this, &CalibWindow::_handleUndistortToggled);
   topBar->addWidget(_undistortBtn);
+
+  _pushUndistortBtn = new QPushButton("Robota Gönder");
+  _pushUndistortBtn->setStyleSheet(kCompactButtonStyle);
+  _pushUndistortBtn->setToolTip("Bu kameranın kalibrasyon sonucunu robotun "
+                                 "multimedia_parameters.rc dosyasına yazar.");
+  _pushUndistortBtn->setEnabled(false);
+  connect(_pushUndistortBtn, &QPushButton::released, this, &CalibWindow::_handlePushUndistort);
+  topBar->addWidget(_pushUndistortBtn);
   topBar->addStretch();
+
   _saveFrameCounter = new QLabel;
-  _saveFrameCounter->setStyleSheet(kDetailLabelStyle);
-  topBar->addWidget(_saveFrameCounter);
+  _saveFrameCounter->setStyleSheet(kMutedSmallLabelStyle);
+  _saveFrameCounter->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+  topBar->addWidget(_saveFrameCounter, 0, Qt::AlignVCenter);
   layout->addLayout(topBar);
+
+  QFrame *topBarDivider = new QFrame;
+  topBarDivider->setFrameShape(QFrame::HLine);
+  topBarDivider->setFixedHeight(1);
+  topBarDivider->setStyleSheet("background-color: " + kColorBorder + "; border: none;");
+  layout->addWidget(topBarDivider);
 
   _RefreshSavedFrameCount();
   _UpdateSaveFrameCounter();
@@ -270,40 +117,41 @@ void CalibWindow::_initCalibUI(QVBoxLayout *layout) {
   connect(_infoBtn, &QPushButton::released, this, &CalibWindow::_handleInfoClicked);
   instructionsRow->addWidget(_infoBtn);
 
-  _calibInstructions = new QLabel(
-    "İpucu: Tahtanın tamamı net görünsün; farklı açı, mesafe ve konumlardan "
-    "(kenarlar dahil) kamerayı sabit tutarak kaydedin.");
+  _calibInstructions = new QLabel("Daha fazla bilgi için buraya tıklayın.");
   _calibInstructions->setWordWrap(true);
   _calibInstructions->setStyleSheet(kDetailLabelStyle);
   instructionsRow->addWidget(_calibInstructions, 1);
   layout->addLayout(instructionsRow);
 
   QHBoxLayout *btnRow = new QHBoxLayout;
+  btnRow->setSpacing(10);
+
+  static const int kActionButtonHeight = 44;
+
   _saveFrameBtn = new QPushButton("Kare Kaydet");
-  _saveFrameBtn->setStyleSheet(kPrimaryButtonStyle);
+  _saveFrameBtn->setStyleSheet(kSecondaryButtonStyle);
   _saveFrameBtn->setFocusPolicy(Qt::NoFocus);
+  _saveFrameBtn->setFixedHeight(kActionButtonHeight);
   connect(_saveFrameBtn, &QPushButton::released, this, &CalibWindow::_handleSaveFrame);
-  btnRow->addWidget(_saveFrameBtn, 2);
+  btnRow->addWidget(_saveFrameBtn, 1);
 
   QShortcut *saveFrameShortcut = new QShortcut(QKeySequence(Qt::Key_Space), this);
   saveFrameShortcut->setContext(Qt::WidgetWithChildrenShortcut);
   connect(saveFrameShortcut, &QShortcut::activated, this, &CalibWindow::_handleSaveFrame);
 
   _calibrateBtn = new QPushButton("KALİBRE ET");
-  _calibrateBtn->setStyleSheet(kPrimaryButtonStyle);
+  _calibrateBtn->setStyleSheet(kPrimaryButtonLargeStyle);
+  _calibrateBtn->setFixedHeight(kActionButtonHeight);
   connect(_calibrateBtn, &QPushButton::released, this, &CalibWindow::_handleCalibrate);
-  btnRow->addWidget(_calibrateBtn, 2);
+  btnRow->addWidget(_calibrateBtn, 1);
 
-  _clearFramesBtn = new QPushButton("Kareleri Temizle");
-  _clearFramesBtn->setStyleSheet(kSecondaryButtonStyle);
+  _clearFramesBtn = new QPushButton(QString::fromUtf8("\xF0\x9F\x97\x91"));
+  _clearFramesBtn->setStyleSheet(kIconButtonDangerStyle);
+  _clearFramesBtn->setFixedSize(36, 36);
+  _clearFramesBtn->setToolTip("Kareleri Temizle");
+  _clearFramesBtn->setAccessibleName("Kareleri Temizle");
   connect(_clearFramesBtn, &QPushButton::released, this, &CalibWindow::_handleClearFrames);
-  btnRow->addWidget(_clearFramesBtn, 1);
-
-  QPushButton *calibExitBtn = new QPushButton("Çıkış");
-  calibExitBtn->setStyleSheet(kSecondaryButtonStyle);
-  calibExitBtn->setMinimumWidth(80);
-  connect(calibExitBtn, &QPushButton::released, qApp, &QApplication::quit);
-  btnRow->addWidget(calibExitBtn);
+  btnRow->addWidget(_clearFramesBtn);
 
   layout->addLayout(btnRow);
 
@@ -317,111 +165,48 @@ void CalibWindow::_initCalibUI(QVBoxLayout *layout) {
 }
 
 void CalibWindow::_handleDisconnect() {
-  if (!_connected) return;
+  if (!_session) return;
   _disconnectBtn->setEnabled(false);
-  if (_livenessTimer) _livenessTimer->stop();
-  if (_busTimer) _busTimer->stop();
-  _connected = false;
-
-  _StopStreamProcess();
-  _StopReceivePipeline();
+  delete _session;
+  _session = nullptr;
 
   emit closed();
 }
 
-void CalibWindow::_StartReceivePipeline() {
-  std::string desc =
-    "udpsrc port=" + std::to_string(STREAM_PORT) + " "
-    "caps=\"application/x-rtp,media=video,clock-rate=90000,encoding-name=RAW,"
-    "sampling=YCbCr-4:2:2,depth=(string)8,width=(string)640,height=(string)480,"
-    "colorimetry=SMPTE240M,payload=96\" "
-    "! rtpvrawdepay ! videoconvert ! video/x-raw,format=RGB "
-    "! appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false";
-
-  GError *error = nullptr;
-  _pipeline = gst_parse_launch(desc.c_str(), &error);
-  if (!_pipeline || error) {
-    ERRPRINTF("[EE] CalibWindow::_StartReceivePipeline: %s\n",
-              error ? error->message : "gst_parse_launch returned null");
-    if (error) g_error_free(error);
-    _ShowStatus("HATA: GStreamer pipeline başlatılamadı.", true);
-    return;
-  }
-
-  _appsink = gst_bin_get_by_name(GST_BIN(_pipeline), "sink");
-  g_signal_connect(_appsink, "new-sample", G_CALLBACK(&CalibWindow::_OnNewSample), this);
-  _bus = gst_pipeline_get_bus(GST_PIPELINE(_pipeline));
-  gst_element_set_state(_pipeline, GST_STATE_PLAYING);
-}
-
-void CalibWindow::_StopReceivePipeline() {
-  if (_pipeline) gst_element_set_state(_pipeline, GST_STATE_NULL);
-  if (_appsink)  { gst_object_unref(_appsink); _appsink = nullptr; }
-  if (_bus)      { gst_object_unref(_bus); _bus = nullptr; }
-  if (_pipeline) { gst_object_unref(_pipeline); _pipeline = nullptr; }
-}
-
-GstFlowReturn CalibWindow::_OnNewSample(GstElement *sink, gpointer userData) {
-  CalibWindow *self = static_cast<CalibWindow *>(userData);
-
-  GstSample *sample = nullptr;
-  g_signal_emit_by_name(sink, "pull-sample", &sample);
-  if (!sample) return GST_FLOW_ERROR;
-
-  GstBuffer *buffer = gst_sample_get_buffer(sample);
-  GstCaps   *caps   = gst_sample_get_caps(sample);
-  GstVideoInfo vinfo;
-  if (buffer && caps && gst_video_info_from_caps(&vinfo, caps)) {
-    GstVideoFrame vframe;
-    if (gst_video_frame_map(&vframe, &vinfo, buffer, GST_MAP_READ)) {
-      const uchar *data = static_cast<const uchar *>(GST_VIDEO_FRAME_PLANE_DATA(&vframe, 0));
-      int stride = GST_VIDEO_FRAME_PLANE_STRIDE(&vframe, 0);
-      int w = GST_VIDEO_FRAME_WIDTH(&vframe);
-      int h = GST_VIDEO_FRAME_HEIGHT(&vframe);
-      // Deep copy now -- vframe/buffer are unmapped/unreffed right after this callback.
-      QImage copy = QImage(data, w, h, stride, QImage::Format_RGB888).copy();
-      gst_video_frame_unmap(&vframe);
-      QMetaObject::invokeMethod(self, "_handleFrameReady", Qt::QueuedConnection,
-                                 Q_ARG(QImage, copy));
-    }
-  }
-  gst_sample_unref(sample);
-  return GST_FLOW_OK;
-}
-
 void CalibWindow::_handleFrameReady(const QImage &frame) {
-  if (!_connected || !_pview || frame.isNull()) return;
-
-  bool wasStale = _lastFrameTimeMs == 0 || _stalled;
-  _lastFrameTimeMs = QDateTime::currentMSecsSinceEpoch();
+  if (!_pview || frame.isNull()) return;
   _lastRawFrame = frame;
   _UpdateDisplayFrame();
-  if (wasStale) {
-    _stalled = false;
-    _ShowStatus("Görüntü alınıyor.");
-  }
 }
 
-bool CalibWindow::_LoadCalibrationForUndistort() {
+void CalibWindow::_handleSessionStatus(const QString &msg, bool error) {
+  _ShowStatus(msg.toStdString(), error);
+}
+
+bool CalibWindow::_LoadCalibrationValues(float &fx, float &fy, float &cx, float &cy,
+                                          std::vector<float> &distCoeffs) {
   std::string path = _GetCalibrationFilePath(0);
-  // Checked separately so the common "no calibration yet" case doesn't make
-  // OpenCV log a scary-looking "Can't open file ... in read mode" error to
-  // stderr for what is normal, expected behavior before the first calibration.
   if (!QFile::exists(QString::fromStdString(path))) return false;
 
   cv::FileStorage fs(path, cv::FileStorage::READ);
   if (!fs.isOpened()) return false;
 
-  float fx = 0.0f, fy = 0.0f, cx = 0.0f, cy = 0.0f;
-  std::vector<float> dc;
+  fx = fy = cx = cy = 0.0f;
+  distCoeffs.clear();
   fs["fx"] >> fx;
   fs["fy"] >> fy;
   fs["cx"] >> cx;
   fs["cy"] >> cy;
-  fs["distortion_coeffs"] >> dc;
+  fs["distortion_coeffs"] >> distCoeffs;
   fs.release();
 
-  if (fx <= 0.0f || fy <= 0.0f || dc.empty()) return false;
+  return fx > 0.0f && fy > 0.0f && !distCoeffs.empty();
+}
+
+bool CalibWindow::_LoadCalibrationForUndistort() {
+  float fx, fy, cx, cy;
+  std::vector<float> dc;
+  if (!_LoadCalibrationValues(fx, fy, cx, cy, dc)) return false;
 
   _cameraMatrix = (cv::Mat_<double>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
   _distCoeffs = cv::Mat((int) dc.size(), 1, CV_64F);
@@ -434,6 +219,39 @@ void CalibWindow::_handleUndistortToggled(bool checked) {
   _UpdateDisplayFrame();
 }
 
+void CalibWindow::_handlePushUndistort() {
+  float fx, fy, cx, cy;
+  std::vector<float> dc;
+  if (!_LoadCalibrationValues(fx, fy, cx, cy, dc)) {
+    _ShowStatus("Gönderilecek bir kalibrasyon dosyası bulunamadı.", true);
+    return;
+  }
+
+  QStringList args{
+    QString::fromUtf8(APPLY_UNDISTORT_PATH), QString::fromStdString(_camera.device),
+    QString::number(fx, 'f', 6), QString::number(fy, 'f', 6),
+    QString::number(cx, 'f', 6), QString::number(cy, 'f', 6)
+  };
+  for (float v : dc) args << QString::number(v, 'f', 9);
+
+  _pushUndistortBtn->setEnabled(false);
+  QProcess pushProcess;
+  ConfigureSshpassProcess(&pushProcess, _camera.sshTarget, _camera.sshPassword, args);
+  pushProcess.start();
+  const int kPushTimeoutMs = 10000;
+  bool finished = pushProcess.waitForFinished(kPushTimeoutMs);
+  _pushUndistortBtn->setEnabled(true);
+
+  if (!finished || pushProcess.exitStatus() != QProcess::NormalExit || pushProcess.exitCode() != 0) {
+    if (!finished) pushProcess.kill();
+    QString err = QString::fromUtf8(pushProcess.readAllStandardError()).trimmed();
+    _ShowStatus("Robota gönderilemedi: "
+                + (err.isEmpty() ? "bilinmeyen hata" : err.toStdString()), true);
+    return;
+  }
+  _ShowStatus("Kalibrasyon robota gönderildi.");
+}
+
 void CalibWindow::_UpdateDisplayFrame() {
   if (!_pview || _lastRawFrame.isNull()) return;
 
@@ -442,9 +260,6 @@ void CalibWindow::_UpdateDisplayFrame() {
     return;
   }
 
-  // cv::undistort is a purely geometric per-pixel remap, so the RGB/BGR channel
-  // order doesn't matter here -- wrapping the QImage's own buffer (no copy) is safe
-  // since it's only read from.
   cv::Mat rgb(_lastRawFrame.height(), _lastRawFrame.width(), CV_8UC3,
               const_cast<uchar *>(_lastRawFrame.constBits()), _lastRawFrame.bytesPerLine());
   cv::Mat undistorted;
@@ -469,7 +284,7 @@ void CalibWindow::_handleInfoClicked() {
     "6. Kalibrasyon tamamlandığında 'Distorsiyonu Düzelt' düğmesini işaretleyerek "
     "sonucu görsel olarak kontrol edebilirsiniz.\n\n"
     "Kullanılan tahta ayarları: %2 x %3 kare, kare boyutu %4 mm, marker boyutu %5 mm.")
-    .arg(kCalibFrameCount)
+    .arg(CalibTools::kFrameCount)
     .arg(_settings.squaresX)
     .arg(_settings.squaresY)
     .arg(_settings.squareLengthM * 1000.0, 0, 'f', 1)
@@ -478,230 +293,40 @@ void CalibWindow::_handleInfoClicked() {
   QMessageBox::information(this, "Kalibrasyon Talimatları", msg);
 }
 
-void CalibWindow::_handleGstBusTimer() {
-  if (!_bus) return;
-  while (gst_bus_have_pending(_bus)) {
-    GstMessage *msg = gst_bus_pop(_bus);
-    switch (GST_MESSAGE_TYPE(msg)) {
-      case GST_MESSAGE_ERROR: {
-        GError *err = nullptr;
-        gchar *debug = nullptr;
-        gst_message_parse_error(msg, &err, &debug);
-        ERRPRINTF("[EE] CalibWindow: GStreamer error: %s\n", err->message);
-        _ShowStatus(std::string("HATA: ") + err->message, true);
-        g_error_free(err);
-        g_free(debug);
-        break;
-      }
-      case GST_MESSAGE_EOS:
-        // Not expected on a live UDP source; defensive only.
-        _ShowStatus("Akış sonlandı (EOS).", true);
-        break;
-      default:
-        break;
-    }
-    gst_message_unref(msg);
-  }
-}
-
-void CalibWindow::_handleLivenessTimer() {
-  if (!_connected) return;
-  if (_lastFrameTimeMs > 0 &&
-      QDateTime::currentMSecsSinceEpoch() - _lastFrameTimeMs > kLivenessTimeoutMs) {
-    _stalled = true;
-    _ShowStatus("Şu anda kameraya ulaşılamıyor!", true);
-  }
-}
-
-void CalibWindow::_StartStreamProcess() {
-  _streamProcess = new QProcess(this);
-  QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-  env.insert("SSHPASS", QString::fromStdString(_camera.sshPassword));
-  _streamProcess->setProcessEnvironment(env);
-
-  // Password auth via sshpass (see MainWindow::_StartListProcess for why); -tt still
-  // requests a remote pty so terminate()/kill() below at least attempts the same
-  // teardown an interrupted interactive SSH session would trigger. This alone isn't
-  // relied on though -- see _StopStreamProcess, which explicitly asks the robot to
-  // stop capturing rather than hoping the SIGHUP propagates through sshpass's own
-  // child ssh process.
-  QStringList args {
-    "-e", "ssh",
-    "-tt",
-    "-o", "BatchMode=no",
-    "-o", QString("ConnectTimeout=%1").arg(SSH_CONNECT_TIMEOUT_SECS),
-    "-o", "StrictHostKeyChecking=accept-new",
-    QString::fromStdString(_camera.sshTarget),
-    QString::fromUtf8(STREAMSERVER_PATH), "-d", QString::fromStdString(_camera.device)
-  };
-  connect(_streamProcess, &QProcess::errorOccurred, this, &CalibWindow::_handleStreamProcessError);
-  connect(_streamProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-          this, &CalibWindow::_handleStreamProcessFinished);
-  _streamProcess->start("sshpass", args);
-}
-
-void CalibWindow::_StopStreamProcess() {
-  if (!_streamProcess) return;
-
-  // Killing/closing the local SSH connection does NOT reliably terminate the
-  // remote gst-launch-1.0 -- confirmed by testing that even `kill -9` on the
-  // local ssh client leaves it running and still holding the V4L2 device,
-  // which is what causes "Device busy"/buffer-allocation failures on the next
-  // stream attempt. gst-launch-1.0's own SIGTERM/SIGINT -> EOS -> NULL shutdown
-  // (which is what actually issues VIDIOC_STREAMOFF/REQBUFS(0) to release the
-  // V4L2 buffer pool) only runs if it actually receives that signal -- so send
-  // it explicitly over a separate one-shot SSH command and WAIT for the remote
-  // side to confirm exit before touching the streaming session at all, instead
-  // of racing a local terminate()/kill() against it as before.
-  //
-  // Prefers streamserver.sh's PID file (exact match, safe with multiple
-  // devices/sessions on the same host) and falls back to a device-scoped
-  // pattern match if it's missing/stale. Bounded remote wait (5s) with
-  // escalation to SIGKILL so a wedged remote process can't block this
-  // indefinitely, and a bounded local waitForFinished on top of that so a dead
-  // network can't either -- this must never hang the client.
-  QString device = QString::fromStdString(_camera.device);
-  QString remoteKillCmd = QString(R"(
-PIDFILE="/tmp/streamserver-$(basename '%1').pid";
-PID=$(cat "$PIDFILE" 2>/dev/null);
-if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null; then
-  PID=$(pgrep -f "v4l2src device=%1 " | head -n1);
-fi;
-if [ -n "$PID" ]; then
-  kill -TERM "$PID" 2>/dev/null;
-  for i in $(seq 1 25); do kill -0 "$PID" 2>/dev/null || exit 0; sleep 0.2; done;
-  kill -KILL "$PID" 2>/dev/null;
-  sleep 0.2;
-fi
-)").arg(device);
-
-  QProcess killProcess;
-  QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-  env.insert("SSHPASS", QString::fromStdString(_camera.sshPassword));
-  killProcess.setProcessEnvironment(env);
-  killProcess.setProgram("sshpass");
-  killProcess.setArguments({
-    "-e", "ssh",
-    "-o", "BatchMode=no",
-    "-o", QString("ConnectTimeout=%1").arg(SSH_CONNECT_TIMEOUT_SECS),
-    "-o", "StrictHostKeyChecking=accept-new",
-    QString::fromStdString(_camera.sshTarget),
-    remoteKillCmd
-  });
-  killProcess.start();
-  // Remote side can itself wait up to ~5s before escalating to SIGKILL; give
-  // the SSH round-trip room on top of that so a live-but-slow connection isn't
-  // mistaken for a wedged remote process and abandoned early.
-  const int kRemoteKillTimeoutMs = (5 + SSH_CONNECT_TIMEOUT_SECS) * 1000 + 3000;
-  if (!killProcess.waitForFinished(kRemoteKillTimeoutMs)) {
-    ERRPRINTF("[WW] CalibWindow::_StopStreamProcess: remote kill command did not "
-              "finish in time; proceeding with local teardown anyway.\n");
-    killProcess.kill();
-    killProcess.waitForFinished(1000);
-  } else if (killProcess.exitStatus() != QProcess::NormalExit || killProcess.exitCode() != 0) {
-    // exit 255 specifically is ssh(1)'s own code for a transport/auth failure of
-    // *this* connection (couldn't connect, host key, connection reset, etc.) --
-    // it is not the remote script's exit status, which is always 0 here whether
-    // or not it found a PID to kill. Capture stderr/stdout so that distinction
-    // (and the actual ssh diagnostic) is visible instead of just the exit code.
-    QString killErr = QString::fromUtf8(killProcess.readAllStandardError()).trimmed();
-    QString killOut = QString::fromUtf8(killProcess.readAllStandardOutput()).trimmed();
-    ERRPRINTF("[WW] CalibWindow::_StopStreamProcess: remote kill command reported "
-              "failure (exit %d); the remote process may still be running.\n"
-              "  stderr: %s\n  stdout: %s\n",
-              killProcess.exitCode(),
-              killErr.isEmpty() ? "(empty)" : killErr.toUtf8().constData(),
-              killOut.isEmpty() ? "(empty)" : killOut.toUtf8().constData());
-  }
-
-  // The remote gst-launch-1.0/streamserver.sh exiting confirmed above usually
-  // already ends this SSH session on its own; this just cleans up whatever's
-  // left (or forces it, if the session is somehow still up) now that it's
-  // safe to do so.
-  if (_streamProcess->state() != QProcess::NotRunning) {
-    _streamProcess->terminate();
-    if (!_streamProcess->waitForFinished(2000)) {
-      _streamProcess->kill();
-      _streamProcess->waitForFinished(1000);
-    }
-  }
-  _streamProcess->deleteLater();
-  _streamProcess = nullptr;
-}
-
-void CalibWindow::_handleStreamProcessError(QProcess::ProcessError error) {
-  if (!_connected) return;
-  if (error == QProcess::FailedToStart) {
-    _ShowStatus("HATA: sshpass çalıştırılamadı (sistemde kurulu mu? "
-                "'sudo apt install sshpass').", true);
-  }
-}
-
-void CalibWindow::_handleStreamProcessFinished(int, QProcess::ExitStatus) {
-  if (!_connected) return;
-
-  // -tt allocates a remote pty, which merges the remote command's stdout/stderr onto
-  // one stream -- ssh usually surfaces that as our "stdout" channel, but read both
-  // since that's not guaranteed. This is what actually explains *why* the stream
-  // ended (e.g. gst-launch failing to negotiate caps against a camera that doesn't
-  // support streamserver.sh's fixed YUY2 640x480 request), instead of just "it ended".
-  QString out = QString::fromUtf8(_streamProcess->readAllStandardOutput()).trimmed();
-  QString err = QString::fromUtf8(_streamProcess->readAllStandardError()).trimmed();
-  QString detail = out;
-  if (!err.isEmpty()) detail += (detail.isEmpty() ? QString() : QString("\n")) + err;
-
-  QString msg = "Kamera akışı sonlandı (SSH bağlantısı koptu).";
-  if (!detail.isEmpty()) {
-    QStringList lines = detail.split('\n', Qt::SkipEmptyParts);
-    const int kKeepLines = 6;
-    if (lines.size() > kKeepLines) lines = lines.mid(lines.size() - kKeepLines);
-    msg += "\n" + lines.join('\n');
-  }
-  _ShowStatus(msg.toStdString(), true);
+std::string CalibWindow::_ResolveDataDir(const std::string &category) {
+  QDir dir(QCoreApplication::applicationDirPath());
+  dir.cdUp();
+  QString relPath = QString::fromStdString(category) + "/"
+                   + QString::fromStdString(CalibTools::SanitizeFolderName(_camera.name));
+  dir.mkpath(relPath);
+  return dir.filePath(relPath).toStdString();
 }
 
 std::string CalibWindow::_GetFramesDirectory() {
-  QDir dir(QCoreApplication::applicationDirPath());
-  dir.cdUp();
-  QString relPath = "Frames/" + QString::fromStdString(SanitizeFolderName(_camera.name));
-  dir.mkpath(relPath);
-  return dir.filePath(relPath).toStdString() + "/";
+  return _ResolveDataDir("Frames") + "/";
 }
 
 std::string CalibWindow::_GetCalibrationFilePath(int cameraIndex) {
-  QDir dir(QCoreApplication::applicationDirPath());
-  dir.cdUp();
-  QString relPath = "Calibrations/" + QString::fromStdString(SanitizeFolderName(_camera.name));
-  dir.mkpath(relPath);
-  return dir.filePath(relPath).toStdString() + "/" + std::to_string(cameraIndex) + ".yaml";
+  return _ResolveDataDir("Calibrations") + "/" + std::to_string(cameraIndex) + ".yaml";
 }
 
 // Syncs _savedFrameCount/_frameIndex with what's actually on disk.
 void CalibWindow::_RefreshSavedFrameCount() {
   std::vector<cv::String> filenames;
-  GlobFrameFiles(_GetFramesDirectory(), &filenames);
+  CalibTools::GlobFrameFiles(_GetFramesDirectory(), &filenames);
 
   _savedFrameCount = (int) filenames.size();
   _frameIndex = 0;
   for (const cv::String &fn : filenames) {
-    std::string base = fn;
-    size_t slash = base.find_last_of('/');
-    if (slash != std::string::npos) base = base.substr(slash + 1);
-    size_t dot = base.find_last_of('.');
-    if (dot != std::string::npos) base = base.substr(0, dot);
-    try {
-      int idx = std::stoi(base);
-      if (idx > _frameIndex) _frameIndex = idx;
-    } catch (const std::invalid_argument &) {
-      // Not a plain numeric frame filename (e.g. left over from an older naming scheme); skip it.
-    }
+    bool isNumeric = false;
+    int idx = QFileInfo(QString::fromStdString(fn)).completeBaseName().toInt(&isNumeric);
+    if (isNumeric && idx > _frameIndex) _frameIndex = idx;
   }
 }
 
 void CalibWindow::_UpdateSaveFrameCounter() {
   _saveFrameCounter->setText(
-    QString("Kare: %1/%2    Silinen: %3")
-      .arg(_savedFrameCount).arg(kCalibFrameCount).arg(_lastRemovedCount));
+    QString("Kare: %1/%2").arg(_savedFrameCount).arg(CalibTools::kFrameCount));
 }
 
 void CalibWindow::_ShowStatus(const std::string &msg, bool error) {
@@ -710,10 +335,9 @@ void CalibWindow::_ShowStatus(const std::string &msg, bool error) {
 }
 
 void CalibWindow::_handleSaveFrame() {
-  if (!_connected) return;
+  if (!_session) return;
 
-  // Always the raw (distorted) frame, regardless of the undistort preview toggle --
-  // calibration must be computed from distorted images.
+  // Always the raw (distorted) frame, regardless of the undistort preview toggle 
   QImage frame = _lastRawFrame;
   if (frame.isNull()) {
     _ShowStatus("Kaydetmeden önce görüntü alınmasını bekleyin.", true);
@@ -745,13 +369,13 @@ void CalibWindow::_handleCalibrate() {
     connect(_calibWatcher, &QFutureWatcher<CalibrationResult>::finished, this, &CalibWindow::_handleCalibrationFinished);
   }
 
-  // The heavy lifting (image decode, ChArUco detection, bundle adjustment) runs on a QtConcurrent worker thread via _RunCalibration
+  // image decode, ChArUco detection, bundle adjustment runs on a QtConcurrent worker thread via CalibTools::RunCalibration
   _calibrateBtn->setEnabled(false);
   _saveFrameBtn->setEnabled(false);
   _clearFramesBtn->setEnabled(false);
   _ShowStatus("Kalibrasyon çalışıyor, lütfen bekleyin...");
 
-  _calibWatcher->setFuture(QtConcurrent::run(_RunCalibration, _GetFramesDirectory(), _settings));
+  _calibWatcher->setFuture(QtConcurrent::run(&CalibTools::RunCalibration, _GetFramesDirectory(), _settings));
 }
 
 void CalibWindow::_handleCalibrationFinished() {
@@ -793,7 +417,9 @@ void CalibWindow::_handleCalibrationFinished() {
   fs.release();
   _ShowStatus("Kalibrasyon başarılı. Kaydedildi: " + yamlPath);
 
-  _undistortBtn->setEnabled(_LoadCalibrationForUndistort());
+  bool hasCalib = _LoadCalibrationForUndistort();
+  _undistortBtn->setEnabled(hasCalib);
+  _pushUndistortBtn->setEnabled(hasCalib);
 }
 
 // Deletes all saved frames in the frames directory after a user confirmation dialog.
@@ -815,7 +441,7 @@ void CalibWindow::_handleClearFrames() {
 int CalibWindow::_ClearSavedFrames() {
   std::string path = _GetFramesDirectory();
   std::vector<cv::String> filenames;
-  GlobFrameFiles(path, &filenames);
+  CalibTools::GlobFrameFiles(path, &filenames);
   int removed = 0;
   for (const cv::String &fn : filenames) {
     if (QFile::remove(QString::fromStdString(fn))) ++removed;
@@ -823,7 +449,6 @@ int CalibWindow::_ClearSavedFrames() {
 
   _frameIndex = 0;
   _savedFrameCount = 0;
-  _lastRemovedCount = removed;
   _UpdateSaveFrameCounter();
   return removed;
 }

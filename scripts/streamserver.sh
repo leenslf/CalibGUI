@@ -37,7 +37,11 @@ list_cameras() {
     fi
 
     echo "Connected cameras:"
-    v4l2-ctl --list-devices
+    # v4l2-ctl --list-devices can exit non-zero if it fails to query one of the
+    # nodes (e.g. a device still held busy by another process) even though it
+    # still prints the full device list beforehand; don't let that abort the
+    # whole listing under set -e.
+    v4l2-ctl --list-devices || true
     echo
     echo "Supported formats per device:"
     for dev in /dev/video*; do
@@ -127,15 +131,21 @@ trap 'rm -f "$PIDFILE"' EXIT
 # camera actually offers (varies a lot between USB cameras -- some only do MJPG,
 # some only support their highest resolution at a lower framerate, etc.); decodebin
 # decodes it if needed (a no-op if it's already raw), and videoconvert/videoscale/
-# videorate normalize it down to the fixed UYVY 640x480@2fps the receiving end
+# videorate normalize it down to the fixed UYVY 1280x720@2fps the receiving end
 # expects, regardless of what the camera natively provides.
+#
+# The queue before rtpvrawpay is required at this frame size -- without it,
+# rtpvrawpay's allocation query propagates back to v4l2src's own mmap buffer
+# pool and fails pool activation ("Failed to allocate required memory"),
+# confirmed by testing directly against a 1280x720 camera.
 gst-launch-1.0 -e \
     v4l2src device="$DEVICE" \
-    ! video/x-raw,format=YUY2,width=640,height=480,framerate=15/1 \
+    ! video/x-raw,format=YUY2,width=1280,height=720,framerate=10/1 \
     ! videoconvert \
     ! videoscale \
     ! videorate \
-    ! video/x-raw,format=UYVY,width=640,height=480,framerate=2/1 \
+    ! video/x-raw,format=UYVY,width=1280,height=720,framerate=2/1 \
+    ! queue \
     ! rtpvrawpay \
     ! udpsink host="$TARGET_IP" port=$PORT &
 GST_PID=$!

@@ -54,9 +54,6 @@ private:
   void _UpdateCameraListHeight();
   void _StartListProcess();
 
-  std::string _ConfigFilePath();
-  void        _LoadSettings();
-
   QStackedWidget *_stack = nullptr;
   QWidget        *_connectPage = nullptr;
 
@@ -80,7 +77,6 @@ private:
   std::string _sshPassword;
   std::vector<RemoteCamera> _cameras;
 
-  CalibSettings _settings;
   CalibWindow  *_calibWindow = nullptr;
 };
 

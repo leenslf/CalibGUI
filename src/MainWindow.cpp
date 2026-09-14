@@ -11,67 +11,17 @@
 #include <QHBoxLayout>
 #include <QFormLayout>
 #include <QFile>
-#include <QDir>
-#include <QCoreApplication>
 #include <QTimer>
 #include <QProcess>
-#include <QProcessEnvironment>
-
-#include <opencv2/core.hpp>
 
 #include "MainWindow.h"
 #include "CalibWindow.h"
 
 #include "config.h"
+#include "SshProcess.h"
 #include "Theme.h"
 #undef DEBUG_LOCAL
 #include "debuglog.h"
-
-// ===========================================================================================================
-static const QString kPrimaryButtonStyle =
-  "QPushButton {"
-  "  background-color: " + kColorAccent + "; color: white; border: none;"
-  "  border-radius: 6px; padding: 10px 28px; font-weight: bold; font-size: 14px;"
-  "}"
-  "QPushButton:hover:!disabled { background-color: " + kColorAccentHover + "; }"
-  "QPushButton:pressed { background-color: " + kColorAccentPressed + "; }"
-  "QPushButton:disabled { background-color: " + kColorAccentMuted + "; color: #eef2fb; }";
-
-
-static const QString kSecondaryButtonStyle =
-  "QPushButton {"
-  "  background-color: transparent; color: " + kColorTextMuted + ";"
-  "  border: 1px solid " + kColorBorder + "; border-radius: 6px;"
-  "  padding: 6px 20px; font-size: 13px;"
-  "}"
-  "QPushButton:hover { background-color: " + kColorHover + "; }"
-  "QPushButton:pressed { background-color: " + kColorBorder + "; }";
-
-static const QString kIconButtonStyle =
-  "QPushButton {"
-  "  background-color: " + kColorSurface + "; color: " + kColorTextMuted + ";"
-  "  border: 1px solid " + kColorBorder + ";"
-  "  border-radius: 6px; font-size: 16px; padding: 2px;"
-  "}"
-  "QPushButton:hover { background-color: " + kColorHover + "; }"
-  "QPushButton:pressed { background-color: " + kColorBorder + "; }";
-
-static const QString kCameraListStyle =
-  "QListWidget {"
-  "  background-color: " + kColorSurface + "; border: 1px solid " + kColorBorder + ";"
-  "  border-radius: 6px; outline: none;"
-  "}"
-  "QListWidget::item { padding: 10px 12px; font-size: 13pt; color: " + kColorText + "; }"
-  "QListWidget::item:hover:!selected { background-color: " + kColorHover + "; }"
-  "QListWidget::item:selected { background-color: " + kColorAccent + "; color: white; }";
-
-static const QString kHeaderLabelStyle =
-  "color: " + kColorText + "; font-size: 13pt; font-weight: 600;";
-
-static const QString kStatusLabelStyle =
-  "color: " + kColorTextMuted + "; font-size: 11pt; padding: 4px 2px;";
-
-// ===========================================================================================================
 
 // Extracts the device index from a v4l2 device node path, e.g. "/dev/video0" -> "0".
 // Used as the folder-naming key (Frames/<name>/, Calibrations/<name>/) since it's
@@ -172,12 +122,8 @@ static std::vector<RemoteCamera> ParseStreamserverCameraList(
   return result;
 }
 
-// ===========================================================================================================
-
 MainWindow::MainWindow(QWidget *parent) : QWidget(parent) {
   setWindowTitle("CalibGUI");
-
-  _LoadSettings();
 
   QVBoxLayout *root = new QVBoxLayout(this);
   _stack = new QStackedWidget;
@@ -205,10 +151,6 @@ MainWindow::~MainWindow() {
 void MainWindow::_initUI() {
   _connectPage = new QWidget;
   QVBoxLayout *layout = new QVBoxLayout(_connectPage);
-
-  QLabel *headerLabel = new QLabel("CalibGUI");
-  headerLabel->setStyleSheet(kHeaderLabelStyle);
-  layout->addWidget(headerLabel);
 
   _connectSubStack = new QStackedWidget;
   layout->addWidget(_connectSubStack);
@@ -256,11 +198,12 @@ void MainWindow::_initIpEntryPage() {
 
   QHBoxLayout *actionRow = new QHBoxLayout;
   actionRow->addStretch();
-  QPushButton *exitBtn = new QPushButton("Çıkış");
-  exitBtn->setStyleSheet(kSecondaryButtonStyle);
-  exitBtn->setMinimumWidth(90);
-  connect(exitBtn, &QPushButton::released, this, &QWidget::close);
-  actionRow->addWidget(exitBtn);
+  // Temporarily disabled -- see MainWindow::_initCameraPickPage for the matching exitBtn.
+  // QPushButton *exitBtn = new QPushButton("Çıkış");
+  // exitBtn->setStyleSheet(kSecondaryButtonStyle);
+  // exitBtn->setMinimumWidth(90);
+  // connect(exitBtn, &QPushButton::released, this, &QWidget::close);
+  // actionRow->addWidget(exitBtn);
   layout->addLayout(actionRow);
 }
 
@@ -307,11 +250,12 @@ void MainWindow::_initCameraPickPage() {
   connect(_connectBtn, &QPushButton::released, this, &MainWindow::_handleConnect);
   actionRow->addWidget(_connectBtn);
   actionRow->addSpacing(12);
-  QPushButton *exitBtn = new QPushButton("Çıkış");
-  exitBtn->setStyleSheet(kSecondaryButtonStyle);
-  exitBtn->setMinimumWidth(90);
-  connect(exitBtn, &QPushButton::released, this, &QWidget::close);
-  actionRow->addWidget(exitBtn);
+  // Temporarily disabled -- see MainWindow::_initIpEntryPage for the matching exitBtn.
+  // QPushButton *exitBtn = new QPushButton("Çıkış");
+  // exitBtn->setStyleSheet(kSecondaryButtonStyle);
+  // exitBtn->setMinimumWidth(90);
+  // connect(exitBtn, &QPushButton::released, this, &QWidget::close);
+  // actionRow->addWidget(exitBtn);
   actionRow->addStretch();
   layout->addLayout(actionRow);
 }
@@ -356,25 +300,12 @@ void MainWindow::_StartListProcess() {
   _UpdateCameraListHeight();
 
   _listProcess = new QProcess(this);
-  QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-  env.insert("SSHPASS", QString::fromStdString(_sshPassword));
-  _listProcess->setProcessEnvironment(env);
-
-  // sshpass feeds the password via the SSHPASS env var above (not argv, so it
-  // doesn't show up in `ps`); BatchMode is off here since password auth requires
-  // ssh to actually prompt (sshpass answers that prompt for us).
-  QStringList args {
-    "-e", "ssh",
-    "-o", "BatchMode=no",
-    "-o", QString("ConnectTimeout=%1").arg(SSH_CONNECT_TIMEOUT_SECS),
-    "-o", "StrictHostKeyChecking=accept-new",
-    QString::fromStdString(_sshTarget),
-    QString::fromUtf8(STREAMSERVER_PATH), "-l"
-  };
+  ConfigureSshpassProcess(_listProcess, _sshTarget, _sshPassword,
+                          { QString::fromUtf8(STREAMSERVER_PATH), "-l" });
   connect(_listProcess, &QProcess::errorOccurred, this, &MainWindow::_handleListProcessError);
   connect(_listProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
           this, &MainWindow::_handleListProcessFinished);
-  _listProcess->start("sshpass", args);
+  _listProcess->start();
 }
 
 void MainWindow::_handleListProcessFinished(int exitCode, QProcess::ExitStatus status) {
@@ -385,7 +316,12 @@ void MainWindow::_handleListProcessFinished(int exitCode, QProcess::ExitStatus s
   _ipSubmitBtn->setEnabled(true);
   _refreshBtn->setEnabled(true);
 
-  if (status != QProcess::NormalExit || exitCode != 0) {
+  // streamserver.sh -l can exit non-zero (e.g. v4l2-ctl failing to query a
+  // device still held busy by another process) while having already printed a
+  // usable "Connected cameras:" block to stdout; only treat this as a hard
+  // connection failure if we didn't actually get a camera list out of it.
+  bool ok = status == QProcess::NormalExit && exitCode == 0;
+  if (!ok && !out.contains("Connected cameras:")) {
     _pickStatusLabel->setText(QString("Bağlanılamadı: %1").arg(
       err.isEmpty() ? QString("bilinmeyen hata") : QString::fromUtf8(err).trimmed()));
     return;
@@ -429,7 +365,7 @@ void MainWindow::_handleConnect() {
   if (row < 0 || row >= (int) _cameras.size() || _calibWindow) return;
   const RemoteCamera camera = _cameras[row];
 
-  _calibWindow = new CalibWindow(camera, _settings);
+  _calibWindow = new CalibWindow(camera);
   connect(_calibWindow, &CalibWindow::closed, this, &MainWindow::_handleCalibWindowClosed);
   _stack->addWidget(_calibWindow);
   _stack->setCurrentWidget(_calibWindow);
@@ -445,33 +381,4 @@ void MainWindow::_handleCalibWindowClosed() {
     _calibWindow->deleteLater();
     _calibWindow = nullptr;
   }
-}
-
-std::string MainWindow::_ConfigFilePath() {
-  QDir dir(QCoreApplication::applicationDirPath());
-  dir.cdUp();
-  dir.mkpath("config");
-  return dir.filePath("config/config.yaml").toStdString();
-}
-
-void MainWindow::_LoadSettings() {
-  _settings = CalibSettings();
-
-  cv::FileStorage fs(_ConfigFilePath(), cv::FileStorage::READ);
-  if (!fs.isOpened()) return;
-
-  auto readInt = [&fs](const char *key, int &field) {
-    cv::FileNode n = fs[key];
-    if (!n.empty()) field = (int) n;
-  };
-  auto readFloat = [&fs](const char *key, float &field) {
-    cv::FileNode n = fs[key];
-    if (!n.empty()) field = (float) n;
-  };
-  readInt("squares_x", _settings.squaresX);
-  readInt("squares_y", _settings.squaresY);
-  readFloat("square_length_m", _settings.squareLengthM);
-  readFloat("marker_length_m", _settings.markerLengthM);
-  readInt("min_valid_frames", _settings.minValidFrames);
-  fs.release();
 }

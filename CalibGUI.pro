@@ -13,7 +13,10 @@ SOURCES += \
   src/main.cpp \
   src/MainWindow.cpp \
   src/CalibWindow.cpp \
-  src/CameraWidget.cpp
+  src/CalibTools.cpp \
+  src/CameraWidget.cpp \
+  src/SshProcess.cpp \
+  src/RemoteStreamSession.cpp
 
 HEADERS += \
   include/config.h \
@@ -21,7 +24,10 @@ HEADERS += \
   include/Theme.h \
   include/MainWindow.h \
   include/CalibWindow.h \
-  include/CameraWidget.h
+  include/CalibTools.h \
+  include/CameraWidget.h \
+  include/SshProcess.h \
+  include/RemoteStreamSession.h
 
 INCLUDEPATH += $$PWD/include
 

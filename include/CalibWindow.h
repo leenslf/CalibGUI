@@ -2,14 +2,12 @@
 #define CALIBWINDOW_H
 
 #include <string>
+#include <vector>
 
 #include <QString>
 #include <QImage>
 #include <QWidget>
 #include <QFutureWatcher>
-#include <QProcess>
-
-#include <gst/gst.h>
 
 #include <opencv2/core.hpp>
 
@@ -18,22 +16,23 @@
 class QVBoxLayout;
 class QPushButton;
 class QLabel;
-class QTimer;
 
 class CameraWidget;
+class RemoteStreamSession;
 
 struct CalibrationResult;
 
 /** Owns a single stream-view + calibration workflow for one RemoteCamera picked from
     MainWindow's camera picker. Constructed by MainWindow with the picked RemoteCamera
-    (robot IP, v4l2 device path, folder-naming index) and the current CalibSettings,
-    then embedded as a page in MainWindow's QStackedWidget so the transition stays
+    (robot IP, v4l2 device path, folder-naming index); board/capture parameters come
+    from CalibSettings's own defaults (they're the same for every camera/session, so
+    there's nothing for MainWindow to pass in). Then embedded as a page in
+    MainWindow's QStackedWidget so the transition stays
     within one real top-level window. The constructor only builds a "Bağlanıyor..."
-    skeleton; MainWindow calls start() right after making the page visible, which (a)
-    starts a local GStreamer receive pipeline listening on STREAM_PORT and (b) SSHes
-    into the robot to run `streamserver.sh -d <device>`, which streams RTP raw video
-    back to us for as long as that SSH session stays alive. Emits closed() whenever
-    MainWindow should take back control.
+    skeleton; MainWindow calls start() right after making the page visible, which
+    creates a RemoteStreamSession (the local GStreamer receive pipeline + the remote
+    SSH `streamserver.sh` session -- see RemoteStreamSession.h) and starts it. Emits
+    closed() whenever MainWindow should take back control.
 
     Also offers a checkable "undistort" preview: if this camera already has a
     calibration file, toggling it applies cv::undistort (using the loaded intrinsics)
@@ -44,8 +43,7 @@ class CalibWindow : public QWidget {
   Q_OBJECT
 
 public:
-  CalibWindow(const RemoteCamera &camera, const CalibSettings &settings,
-              QWidget *parent = nullptr);
+  CalibWindow(const RemoteCamera &camera, QWidget *parent = nullptr);
   virtual ~CalibWindow();
 
   // Starts the local GStreamer receive pipeline and the remote SSH stream session,
@@ -58,21 +56,20 @@ signals:
 
 private slots:
   void _handleDisconnect();
-  void _handleGstBusTimer();
-  void _handleLivenessTimer();
   void _handleFrameReady(const QImage &frame);
+  void _handleSessionStatus(const QString &msg, bool error);
   void _handleSaveFrame();
   void _handleCalibrate();
   void _handleCalibrationFinished();
   void _handleClearFrames();
   void _handleUndistortToggled(bool checked);
+  void _handlePushUndistort();
   void _handleInfoClicked();
-  void _handleStreamProcessError(QProcess::ProcessError error);
-  void _handleStreamProcessFinished(int exitCode, QProcess::ExitStatus exitStatus);
 
 private:
   void _initCalibUI(QVBoxLayout *layout);
 
+  std::string _ResolveDataDir(const std::string &category);
   std::string _GetFramesDirectory();
   std::string _GetCalibrationFilePath(int cameraIndex);
   void        _RefreshSavedFrameCount();
@@ -80,23 +77,23 @@ private:
   void        _ShowStatus(const std::string &msg, bool error = false);
   int         _ClearSavedFrames();
 
-  void _StartReceivePipeline();
-  void _StopReceivePipeline();
-  void _StartStreamProcess();
-  void _StopStreamProcess();
-
   // Looks for this camera's Calibrations/<name>/0.yaml (written by
   // _handleCalibrationFinished) and, if present and valid, loads _cameraMatrix/
   // _distCoeffs from it. Returns whether a usable calibration was loaded -- the
-  // return value directly drives whether _undistortBtn is enabled.
+  // return value directly drives whether _undistortBtn/_pushUndistortBtn are enabled.
   bool _LoadCalibrationForUndistort();
+
+  // Raw read of Calibrations/<name>/0.yaml's fx/fy/cx/cy/distortion_coeffs, shared by
+  // _LoadCalibrationForUndistort (which builds _cameraMatrix/_distCoeffs from it) and
+  // _handlePushUndistort (which just needs the plain numbers to hand to the remote
+  // copy_undistort.sh script). Returns false if no valid calibration file exists.
+  bool _LoadCalibrationValues(float &fx, float &fy, float &cx, float &cy,
+                               std::vector<float> &distCoeffs);
 
   // Renders _lastRawFrame into _pview, applying cv::undistort first if the toggle
   // is on and a calibration was loaded. Called on every new frame and immediately
   // on toggle so flipping the button doesn't wait for the next frame to arrive.
   void _UpdateDisplayFrame();
-
-  static GstFlowReturn _OnNewSample(GstElement *sink, gpointer userData);
 
   RemoteCamera  _camera;
   CalibSettings _settings;
@@ -113,19 +110,13 @@ private:
   QPushButton *_clearFramesBtn = nullptr;
   QPushButton *_disconnectBtn = nullptr;
   QPushButton *_undistortBtn = nullptr;
+  QPushButton *_pushUndistortBtn = nullptr;
   QPushButton *_infoBtn = nullptr;
   QLabel      *_statusLabel = nullptr;
 
   QFutureWatcher<CalibrationResult> *_calibWatcher = nullptr;
 
-  GstElement *_pipeline = nullptr;
-  GstElement *_appsink  = nullptr;
-  GstBus     *_bus      = nullptr;
-
-  QTimer *_busTimer = nullptr;
-  QTimer *_livenessTimer = nullptr;
-
-  QProcess *_streamProcess = nullptr;
+  RemoteStreamSession *_session = nullptr;
 
   cv::Mat _cameraMatrix;   // empty until a calibration file is loaded
   cv::Mat _distCoeffs;
@@ -134,13 +125,8 @@ private:
                            // display-when-not-undistorting and for saved calibration
                            // frames, so toggling undistortion never taints Kare Kaydet
 
-  bool   _connected = false;
-  bool   _stalled = false;
-  qint64 _lastFrameTimeMs = 0;
-
   int _frameIndex = 0;
   int _savedFrameCount = 0;
-  int _lastRemovedCount = 0;
 };
 
 #endif

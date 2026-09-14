@@ -7,13 +7,12 @@
 /** Utility macro to set the CSS class for QT objects.*/
 #define SETCLASS(ptr, name) {(ptr)->setProperty("cssclass",name);(ptr)->setStyleSheet(" ");}
 
-/** Fixed UDP port CalibGUI's local GStreamer receive pipeline (udpsrc) listens on
-    for the RTP raw-video stream pushed by streamserver.sh. Must match
-    streamserver.sh's hardcoded PORT; not user-configurable. */
+// Fixed UDP port CalibGUI's local GStreamer receive pipeline (udpsrc) 
 constexpr const unsigned short STREAM_PORT = 5600;
 
-/** Fixed path to streamserver.sh in the SSH user's home directory on the robot. */
-constexpr const char *const STREAMSERVER_PATH = "~/streamserver.sh";
+constexpr const char *const STREAMSERVER_PATH = "~/scripts/streamserver.sh";
+constexpr const char *const STOPSTREAM_PATH = "~/scripts/stop_stream.sh";
+constexpr const char *const APPLY_UNDISTORT_PATH = "~/scripts/copy_undistort.sh";
 
 /** ssh(1) ConnectTimeout in seconds, used for both the one-shot `-l` listing call
     and the long-lived `-d` streaming session, so a bad/unreachable IP fails fast
@@ -39,13 +38,9 @@ struct RemoteCamera {
                             // SanitizeFolderName() input for Frames/<name>/ and
                             // Calibrations/<name>/, derived from `device` at parse time
 };
-
-/** ChArUco board / capture parameters, persisted to config/config.yaml and loaded on
-    startup. Defaults match the values CalibGUI shipped with before this was
-    read-only (there's currently no in-app editor; edit config.yaml directly). */
 struct CalibSettings {
-  int   squaresX       = 6;
-  int   squaresY       = 8;
+  int   squaresX       = 8;
+  int   squaresY       = 6;
   float squareLengthM  = 0.022f;
   float markerLengthM  = 0.016f;
   int   minValidFrames = 4;

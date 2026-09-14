@@ -12,12 +12,13 @@ Minimal Qt console for camera calibration. Scoped to just:
 
 ## Streaming a camera
 
-`streamserver.sh` must already be present at `~/streamserver.sh` on the robot. It
-streams uncompressed video from a v4l2 device to whichever machine ran it over SSH:
+`streamserver.sh` must already be present at `~/scripts/streamserver.sh` on the
+robot. It streams uncompressed video from a v4l2 device to whichever machine ran
+it over SSH:
 
 ```sh
-ssh root@<robot-ip> ~/streamserver.sh -l          # list connected cameras
-ssh root@<robot-ip> ~/streamserver.sh -d /dev/video0
+ssh root@<robot-ip> ~/scripts/streamserver.sh -l          # list connected cameras
+ssh root@<robot-ip> ~/scripts/streamserver.sh -d /dev/video0
 ```
 
 CalibGUI runs both of these itself (from the IP-entry and camera-picker steps) --
