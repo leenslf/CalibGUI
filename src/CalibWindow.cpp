@@ -296,7 +296,11 @@ void CalibWindow::_handleInfoClicked() {
 std::string CalibWindow::_ResolveDataDir(const std::string &category) {
   QDir dir(QCoreApplication::applicationDirPath());
   dir.cdUp();
+  std::string host = _camera.sshTarget;
+  size_t atPos = host.find('@');
+  if (atPos != std::string::npos) host = host.substr(atPos + 1);
   QString relPath = QString::fromStdString(category) + "/"
+                   + QString::fromStdString(CalibTools::SanitizeFolderName(host)) + "/"
                    + QString::fromStdString(CalibTools::SanitizeFolderName(_camera.name));
   dir.mkpath(relPath);
   return dir.filePath(relPath).toStdString();

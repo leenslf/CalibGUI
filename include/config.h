@@ -35,8 +35,9 @@ struct RemoteCamera {
                             // -- display text in the picker list only, not used for paths
   std::string device;      // v4l2 device node, e.g. "/dev/video0"
   std::string name;        // device index, e.g. "0" for /dev/video0 -- the
-                            // SanitizeFolderName() input for Frames/<name>/ and
-                            // Calibrations/<name>/, derived from `device` at parse time
+                            // SanitizeFolderName() input for Frames/<host>/<name>/ and
+                            // Calibrations/<host>/<name>/, derived from `device` at parse
+                            // time; <host> is the host part of sshTarget (after '@')
 };
 struct CalibSettings {
   int   squaresX       = 8;
