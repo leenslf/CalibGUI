@@ -18,11 +18,53 @@ set -euo pipefail
 PORT=5600
 DEVICE="/dev/video0"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MAP_CAMS_SCRIPT="$SCRIPT_DIR/map_cams.sh"
+
 usage() {
-    echo "Usage: $0 [-d /dev/videoX]"
-    echo "  -d   V4L2 device to stream from (default: /dev/video0)"
+    echo "Usage: $0 [-d /dev/videoX|name]"
+    echo "  -d   V4L2 device to stream from, either a /dev/videoX node or a"
+    echo "       mapped name from map_cams.sh e.g. 'frontcam' (default: /dev/video0)"
     echo "  -l   List connected cameras/video devices and exit"
     exit 1
+}
+
+# Prints "<name> = /dev/videoX" lines by delegating to map_cams.sh, if present
+# and runnable; silently prints nothing otherwise (e.g. no udev rules file on
+# this host, or map_cams.sh not deployed alongside this script).
+device_name_map() {
+    [[ -x "$MAP_CAMS_SCRIPT" ]] || return 0
+    "$MAP_CAMS_SCRIPT" 2>/dev/null || true
+}
+
+# Resolves a mapped name (e.g. "frontcam") to its current /dev/videoX node by
+# looking it up in device_name_map's output. Prints nothing if not found.
+resolve_device_name() {
+    local name="$1"
+    device_name_map | awk -v n="$name" '$1==n {print $3; exit}'
+}
+
+# Resolves a /dev/videoX node back to its mapped name, if any. Prints nothing
+# if not found.
+resolve_device_path() {
+    local dev="$1"
+    device_name_map | awk -v d="$dev" '$3==d {print $1; exit}'
+}
+
+# Builds a sed script that rewrites every raw /dev/videoX node to its mapped
+# display path (e.g. /dev/video2 -> /dev/frontcam), so callers -- the CalibGUI
+# C++ side included -- only ever see and pass around the mapped name, without
+# needing their own copy of the mapping. Prints nothing (empty script) if no
+# mapping is available.
+device_name_sed_script() {
+    local map name eq raw_dev script=""
+    map=$(device_name_map)
+    [[ -n "$map" ]] || return 0
+    while read -r name eq raw_dev; do
+        [[ -n "$name" && -n "$raw_dev" ]] || continue
+        script+="s#${raw_dev}\\b#/dev/${name}#g;"
+    done <<< "$map"
+    printf '%s' "$script"
 }
 
 list_cameras() {
@@ -36,16 +78,25 @@ list_cameras() {
         exit 0
     fi
 
+    local sed_script
+    sed_script=$(device_name_sed_script)
+
     echo "Connected cameras:"
     # v4l2-ctl --list-devices can exit non-zero if it fails to query one of the
     # nodes (e.g. a device still held busy by another process) even though it
     # still prints the full device list beforehand; don't let that abort the
     # whole listing under set -e.
-    v4l2-ctl --list-devices || true
+    if [[ -n "$sed_script" ]]; then
+        v4l2-ctl --list-devices 2>&1 | sed "$sed_script" || true
+    else
+        v4l2-ctl --list-devices || true
+    fi
     echo
     echo "Supported formats per device:"
     for dev in /dev/video*; do
-        echo "--- $dev ---"
+        local header="$dev"
+        [[ -n "$sed_script" ]] && header=$(sed "$sed_script" <<< "$dev")
+        echo "--- $header ---"
         v4l2-ctl --device="$dev" --list-formats-ext 2>/dev/null \
             || echo "  (could not query formats)"
         echo
@@ -77,6 +128,13 @@ if [[ -z "$TARGET_IP" ]]; then
     exit 1
 fi
 
+# --- Resolve a mapped name (e.g. "frontcam" or "/dev/frontcam") to its real
+# /dev/videoX node. Works even if no /dev/frontcam node actually exists on
+# disk, since the mapping (not the filesystem) is authoritative here.
+LOOKUP_NAME="${DEVICE#/dev/}"
+RESOLVED=$(resolve_device_name "$LOOKUP_NAME")
+[[ -n "$RESOLVED" ]] && DEVICE="$RESOLVED"
+
 # --- Verify the capture device exists ---
 if [[ ! -e "$DEVICE" ]]; then
     echo "ERROR: device '$DEVICE' does not exist." >&2
@@ -84,6 +142,8 @@ if [[ ! -e "$DEVICE" ]]; then
     ls -1 /dev/video* 2>/dev/null || echo "  (none found)" >&2
     exit 1
 fi
+
+DEVICE_NAME=$(resolve_device_path "$DEVICE")
 
 # --- Self-heal: reclaim the device if a previous instance is still holding it ---
 # Guards against clients that disconnect abnormally (network drop, sleep, crash)
@@ -117,7 +177,11 @@ fi
 # pipeline shape for this exact device.
 _reclaim_device "$(pgrep -f "v4l2src device=$DEVICE " | head -n1 || true)"
 
-echo "Streaming from $DEVICE to $TARGET_IP:$PORT (uncompressed, 2fps)..."
+if [[ -n "$DEVICE_NAME" ]]; then
+    echo "Streaming from $DEVICE (name: $DEVICE_NAME) to $TARGET_IP:$PORT (uncompressed, 2fps)..."
+else
+    echo "Streaming from $DEVICE to $TARGET_IP:$PORT (uncompressed, 2fps)..."
+fi
 echo "Press Ctrl+C to stop."
 
 trap 'rm -f "$PIDFILE"' EXIT

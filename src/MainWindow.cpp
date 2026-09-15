@@ -23,16 +23,13 @@
 #undef DEBUG_LOCAL
 #include "debuglog.h"
 
-// Extracts the device index from a v4l2 device node path, e.g. "/dev/video0" -> "0".
-// Used as the folder-naming key (Frames/<name>/, Calibrations/<name>/) since it's
-// short and always uniquely identifies which node was picked, unlike the v4l2-ctl
-// camera label (which can be long, spacey, or repeated across robots).
+// Extracts the node name from a v4l2 device node path, e.g. "/dev/video0" -> "video0".
+// Used as the folder-naming key (Frames/<name>/, Calibrations/<name>/) since it always
+// uniquely identifies which node was picked, unlike the v4l2-ctl camera label (which
+// can be long, spacey, or repeated across robots).
 static std::string DeviceIndexName(const std::string &device) {
   size_t slash = device.find_last_of('/');
-  std::string base = (slash != std::string::npos) ? device.substr(slash + 1) : device;
-  static const std::string kPrefix = "video";
-  if (base.compare(0, kPrefix.size(), kPrefix) == 0) base = base.substr(kPrefix.size());
-  return base;
+  return (slash != std::string::npos) ? device.substr(slash + 1) : device;
 }
 
 // Parses the "Supported formats per device:" block of `streamserver.sh -l`'s
@@ -42,7 +39,15 @@ static std::string DeviceIndexName(const std::string &device) {
 // metadata-only sibling with zero supported formats); this lets
 // ParseStreamserverCameraList tell them apart instead of assuming the first node
 // listed under a camera is always the capture-capable one.
-static std::set<std::string> ParseCapableDevices(const std::string &stdoutText) {
+//
+// `outAllDevices`, if non-null, additionally collects every device header seen
+// in this block regardless of capability -- this is the authoritative set of
+// device tokens streamserver.sh actually probed (one per real /dev/videoN
+// node, but already rewritten to its map_cams.sh name, e.g. "/dev/frontcam",
+// when one exists), which ParseStreamserverCameraList uses to recognize device
+// lines in "Connected cameras:" that no longer look like "/dev/videoN".
+static std::set<std::string> ParseCapableDevices(
+    const std::string &stdoutText, std::set<std::string> *outAllDevices = nullptr) {
   std::set<std::string> capable;
   QString text = QString::fromStdString(stdoutText);
   int start = text.indexOf("Supported formats per device:");
@@ -54,6 +59,7 @@ static std::set<std::string> ParseCapableDevices(const std::string &stdoutText) 
     QString trimmed = rawLine.trimmed();
     if (trimmed.startsWith("--- ") && trimmed.endsWith(" ---")) {
       currentDevice = trimmed.mid(4, trimmed.length() - 8).trimmed();
+      if (outAllDevices && !currentDevice.isEmpty()) outAllDevices->insert(currentDevice.toStdString());
     } else if (!currentDevice.isEmpty() && trimmed.startsWith("[") && trimmed.contains("]:")) {
       capable.insert(currentDevice.toStdString());
     }
@@ -64,15 +70,18 @@ static std::set<std::string> ParseCapableDevices(const std::string &stdoutText) 
 // Parses the "Connected cameras:" block of `streamserver.sh -l`'s stdout (i.e.
 // `v4l2-ctl --list-devices`'s own output): groups separated by blank lines, a
 // non-indented header line ending in ':' names the physical camera, followed by one
-// or more indented "/dev/videoN" lines. Of those, the first one that
-// ParseCapableDevices confirms actually supports capture is kept (falling back to
-// the first line listed if none are confirmed capable, e.g. if that section failed
-// to parse).
+// or more indented device-node lines -- normally "/dev/videoN", but streamserver.sh
+// rewrites these to their map_cams.sh name when one is mapped (e.g. "/dev/frontcam"),
+// so lines are recognized against allDevices (from ParseCapableDevices) rather than
+// a hardcoded "/dev/video" prefix. Of those, the first one that ParseCapableDevices
+// confirms actually supports capture is kept (falling back to the first line listed
+// if none are confirmed capable, e.g. if that section failed to parse).
 static std::vector<RemoteCamera> ParseStreamserverCameraList(
     const std::string &stdoutText, const std::string &sshTarget,
     const std::string &sshPassword) {
   std::vector<RemoteCamera> result;
-  std::set<std::string> capableDevices = ParseCapableDevices(stdoutText);
+  std::set<std::string> allDevices;
+  std::set<std::string> capableDevices = ParseCapableDevices(stdoutText, &allDevices);
   QString text = QString::fromStdString(stdoutText);
 
   int start = text.indexOf("Connected cameras:");
@@ -113,7 +122,7 @@ static std::vector<RemoteCamera> ParseStreamserverCameraList(
       flushGroup();  // defensive: in case a group isn't blank-line-terminated
       currentLabel = trimmed.chopped(1).trimmed();
       currentDevices.clear();
-    } else if (indented && trimmed.startsWith("/dev/video") && !currentLabel.isEmpty()) {
+    } else if (indented && !currentLabel.isEmpty() && allDevices.count(trimmed.toStdString())) {
       currentDevices.push_back(trimmed.toStdString());
     }
   }

@@ -7,7 +7,8 @@
 # (invoked over SSH by CalibGUI, see APPLY_UNDISTORT_PATH in config.h).
 #
 # Finds the structArray block whose `uri = "v4l2://<device>";` matches the
-# given device, then sets/inserts `bool undistort = true;` and a
+# given device -- either its /dev/videoX path or its map_cams.sh name (e.g.
+# "frontcam") -- then sets/inserts `bool undistort = true;` and a
 # `struct undistort_params { ... }` with the given values in that block only.
 # Every other block/line/comment in the file is left byte-for-byte unchanged.
 
@@ -33,12 +34,39 @@ if [ ! -f "$RC_FILE" ]; then
   exit 1
 fi
 
-#   TODO: naming on the rc sometimes is different than the device path
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MAP_CAMS_SCRIPT="$SCRIPT_DIR/map_cams.sh"
+
+# $DEVICE may be a raw /dev/videoX node or a map_cams.sh mapped name, passed
+# either bare ("frontcam") or as a synthetic path ("/dev/frontcam") -- the
+# mapping (not the filesystem) is authoritative here, so this works even if
+# no /dev/frontcam node actually exists on disk.
+DEVICE_NAME=""
+MAP=""
+if [ -x "$MAP_CAMS_SCRIPT" ]; then
+  MAP=$("$MAP_CAMS_SCRIPT" 2>/dev/null)
+fi
+if [ -n "$MAP" ]; then
+  LOOKUP_NAME="${DEVICE#/dev/}"
+  MAPPED_DEVICE=$(printf '%s\n' "$MAP" | awk -v n="$LOOKUP_NAME" '$1==n {print $3; exit}')
+  if [ -n "$MAPPED_DEVICE" ]; then
+    DEVICE_NAME="$LOOKUP_NAME"
+    DEVICE="$MAPPED_DEVICE"
+  else
+    DEVICE_NAME=$(printf '%s\n' "$MAP" | awk -v d="$DEVICE" '$3==d {print $1; exit}')
+  fi
+fi
+
+# Naming on the rc sometimes differs from the device path (e.g. it uses the
+# udev-mapped name like "v4l2://frontcam" instead of "v4l2:///dev/video2"), so
+# match candidates against the resolved /dev/videoX path as well as the
+# mapped name from map_cams.sh.
 RESOLVED_DEVICE=$(readlink -f "$DEVICE" 2>/dev/null || echo "$DEVICE")
 while IFS= read -r candidate; do
   [ -n "$candidate" ] || continue
   resolved_candidate=$(readlink -f "$candidate" 2>/dev/null || echo "$candidate")
-  if [ "$resolved_candidate" = "$RESOLVED_DEVICE" ]; then
+  if [ "$resolved_candidate" = "$RESOLVED_DEVICE" ] || \
+     { [ -n "$DEVICE_NAME" ] && [ "$candidate" = "$DEVICE_NAME" ]; }; then
     DEVICE=$candidate
     break
   fi

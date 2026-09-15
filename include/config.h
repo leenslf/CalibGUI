@@ -34,7 +34,7 @@ struct RemoteCamera {
   std::string label;       // v4l2-ctl group header text, e.g. "USB Camera (usb-...)"
                             // -- display text in the picker list only, not used for paths
   std::string device;      // v4l2 device node, e.g. "/dev/video0"
-  std::string name;        // device index, e.g. "0" for /dev/video0 -- the
+  std::string name;        // device node name, e.g. "video0" for /dev/video0 -- the
                             // SanitizeFolderName() input for Frames/<host>/<name>/ and
                             // Calibrations/<host>/<name>/, derived from `device` at parse
                             // time; <host> is the host part of sshTarget (after '@')
