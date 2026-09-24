@@ -1,49 +1,54 @@
 #!/bin/sh
-# map_cams.sh — resolve /dev/videoX nodes to their udev symlink names
-# by tracing ATTRS{serial} against /etc/udev/rules.d/99-trhex_cameras.rules
+# map_cams.sh — resolve /dev/videoX nodes to udev symlink names
+# by matching KERNELS (USB port path) from the rules file.
+# Usage: ./map_cams.sh [-n name | -p /dev/videoX] [rules_file]
 #
-# Usage: ./map_cams.sh [rules_file]
-# Prints one "<name> = /dev/videoX" line per resolved capture device, e.g.:
-#   frontcam = /dev/video2
-#   rightcam = /dev/video4
-#   leftcam  = /dev/video6
-#   rearcam  = /dev/video8
+#   (no option)  print every "<name> = /dev/videoX" pair
+#   -n name      print the /dev/videoX node for a mapped name ("frontcam" or
+#                "/dev/frontcam"); prints nothing if unmapped
+#   -p /dev/videoX
+#                print the mapped name for a node; prints nothing if unmapped
+
+LOOKUP=""
+LOOKUP_ARG=""
+while getopts "n:p:" opt; do
+    case "$opt" in
+        n) LOOKUP=name; LOOKUP_ARG="${OPTARG#/dev/}" ;;
+        p) LOOKUP=path; LOOKUP_ARG="$OPTARG" ;;
+        *) echo "Usage: $0 [-n name | -p /dev/videoX] [rules_file]" >&2; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
 
 RULES_FILE="${1:-/etc/udev/rules.d/99-trhex_cameras.rules}"
 
-if [ ! -r "$RULES_FILE" ]; then
-    echo "Cannot read rules file: $RULES_FILE" >&2
-    exit 1
-fi
+[ -r "$RULES_FILE" ] || { echo "Cannot read rules file: $RULES_FILE" >&2; exit 1; }
 
-# Build "serial name" pairs, only from the capture (non-hidraw) lines
-# e.g. ACTION=="add", ATTRS{serial}=="2C059700", ENV{ID_V4L_CAPABILITIES}==":capture:", SYMLINK+="frontcam"
-MAP=$(grep 'ID_V4L_CAPABILITIES' "$RULES_FILE" | \
-    sed -n 's/.*ATTRS{serial}=="\([^"]*\)".*SYMLINK+="\([^"]*\)".*/\1 \2/p')
+# "port name" pairs from the video4linux rules only
+MAP=$(sed -n 's/.*SUBSYSTEM=="video4linux".*KERNELS=="\([^"]*\)".*SYMLINK+="\([^"]*\)".*/\1 \2/p' "$RULES_FILE")
 
-if [ -z "$MAP" ]; then
-    echo "No capture-mode serial/symlink pairs found in $RULES_FILE" >&2
-    exit 1
-fi
+[ -n "$MAP" ] || { echo "No video4linux KERNELS/SYMLINK pairs found in $RULES_FILE" >&2; exit 1; }
 
-for dev in /dev/video*; do
-    [ -e "$dev" ] || continue
+list_map() {
+    for dev in /dev/video*; do
+        [ -e "$dev" ] || continue
+        base=$(basename "$dev")
 
-    # Only consider capture nodes (skip metadata-only nodes)
-    caps=$(udevadm info -q property -n "$dev" 2>/dev/null | grep '^ID_V4L_CAPABILITIES=')
-    case "$caps" in
-        *:capture:*) ;;
-        *) continue ;;
-    esac
+        # Same filter as the rules: only the first node (index 0) of each camera
+        [ "$(cat /sys/class/video4linux/$base/index 2>/dev/null)" = "0" ] || continue
 
-    serial=$(udevadm info -a -n "$dev" 2>/dev/null | \
-        grep -m1 'ATTRS{serial}==' | sed 's/.*ATTRS{serial}=="\([^"]*\)".*/\1/')
+        info=$(udevadm info -a -n "$dev" 2>/dev/null)
 
-    [ -z "$serial" ] && continue
+        printf '%s\n' "$MAP" | while read -r port name; do
+            if printf '%s\n' "$info" | grep -q "KERNELS==\"$port\""; then
+                echo "$name = $dev"
+            fi
+        done
+    done
+}
 
-    name=$(printf '%s\n' "$MAP" | awk -v s="$serial" '$1==s {print $2; exit}')
-
-    if [ -n "$name" ]; then
-        echo "$name = $dev"
-    fi
-done
+case "$LOOKUP" in
+    name) list_map | awk -v n="$LOOKUP_ARG" '$1==n {print $3; exit}' ;;
+    path) list_map | awk -v d="$LOOKUP_ARG" '$3==d {print $1; exit}' ;;
+    *)    list_map ;;
+esac

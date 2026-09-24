@@ -228,7 +228,7 @@ void CalibWindow::_handlePushUndistort() {
   }
 
   QStringList args{
-    QString::fromUtf8(APPLY_UNDISTORT_PATH), QString::fromStdString(_camera.device),
+    QString::fromUtf8(COPY_UNDISTORT_PATH), QString::fromStdString(_camera.device),
     QString::number(fx, 'f', 6), QString::number(fy, 'f', 6),
     QString::number(cx, 'f', 6), QString::number(cy, 'f', 6)
   };

@@ -12,7 +12,7 @@ constexpr const unsigned short STREAM_PORT = 5600;
 
 constexpr const char *const STREAMSERVER_PATH = "~/scripts/streamserver.sh";
 constexpr const char *const STOPSTREAM_PATH = "~/scripts/stop_stream.sh";
-constexpr const char *const APPLY_UNDISTORT_PATH = "~/scripts/copy_undistort.sh";
+constexpr const char *const COPY_UNDISTORT_PATH = "~/scripts/copy_undistort.sh";
 
 /** ssh(1) ConnectTimeout in seconds, used for both the one-shot `-l` listing call
     and the long-lived `-d` streaming session, so a bad/unreachable IP fails fast

@@ -4,7 +4,7 @@
 # Writes a camera calibration result into the matching stream entry of
 # multimedia_parameters.rc so the robot's own video pipeline applies
 # undistortion (not just CalibGUI's local preview). Run on the robot itself
-# (invoked over SSH by CalibGUI, see APPLY_UNDISTORT_PATH in config.h).
+# (invoked over SSH by CalibGUI, see COPY_UNDISTORT_PATH in config.h).
 #
 # Finds the structArray block whose `uri = "v4l2://<device>";` matches the
 # given device -- either its /dev/videoX path or its map_cams.sh name (e.g.
@@ -41,20 +41,12 @@ MAP_CAMS_SCRIPT="$SCRIPT_DIR/map_cams.sh"
 # either bare ("frontcam") or as a synthetic path ("/dev/frontcam") -- the
 # mapping (not the filesystem) is authoritative here, so this works even if
 # no /dev/frontcam node actually exists on disk.
-DEVICE_NAME=""
-MAP=""
-if [ -x "$MAP_CAMS_SCRIPT" ]; then
-  MAP=$("$MAP_CAMS_SCRIPT" 2>/dev/null)
-fi
-if [ -n "$MAP" ]; then
-  LOOKUP_NAME="${DEVICE#/dev/}"
-  MAPPED_DEVICE=$(printf '%s\n' "$MAP" | awk -v n="$LOOKUP_NAME" '$1==n {print $3; exit}')
-  if [ -n "$MAPPED_DEVICE" ]; then
-    DEVICE_NAME="$LOOKUP_NAME"
-    DEVICE="$MAPPED_DEVICE"
-  else
-    DEVICE_NAME=$(printf '%s\n' "$MAP" | awk -v d="$DEVICE" '$3==d {print $1; exit}')
-  fi
+MAPPED_DEVICE=$("$MAP_CAMS_SCRIPT" -n "$DEVICE" 2>/dev/null)
+if [ -n "$MAPPED_DEVICE" ]; then
+  DEVICE_NAME="${DEVICE#/dev/}"
+  DEVICE="$MAPPED_DEVICE"
+else
+  DEVICE_NAME=$("$MAP_CAMS_SCRIPT" -p "$DEVICE" 2>/dev/null)
 fi
 
 # Naming on the rc sometimes differs from the device path (e.g. it uses the
@@ -70,7 +62,7 @@ while IFS= read -r candidate; do
     DEVICE=$candidate
     break
   fi
-done < <(grep -oP 'uri\s*=\s*"v4l2://\K[^"]+' "$RC_FILE")
+done < <(sed -n 's|.*uri[[:space:]]*=[[:space:]]*"v4l2://\([^"]*\)".*|\1|p' "$RC_FILE")
 
 TMP_FILE="${RC_FILE}.tmp.$$"
 

@@ -7,22 +7,6 @@
 #
 # Usage:
 #   ./stop_stream.sh /dev/videoX
-#
-# Run over SSH by CalibGUI (see CalibWindow::_StopStreamProcess) instead of
-# relying on the SSH connection itself to end the remote gst-launch-1.0 --
-# confirmed by testing that killing/closing the local ssh client does NOT
-# reliably terminate it, which leaves it still holding the V4L2 device and
-# causes "Device busy"/buffer-allocation failures on the next stream attempt.
-# gst-launch-1.0's own SIGTERM -> EOS -> NULL shutdown (which is what actually
-# issues VIDIOC_STREAMOFF/REQBUFS(0) to release the V4L2 buffer pool) only
-# runs if it actually receives that signal.
-#
-# Prefers streamserver.sh's PID file (exact match, safe with multiple
-# devices/sessions on the same host) and falls back to a device-scoped pgrep
-# pattern match if it's missing/stale (mirrors streamserver.sh's own
-# _reclaim_device). Escalates to SIGKILL if the process doesn't exit within
-# ~5s so a wedged remote process can't block the caller indefinitely.
-
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
@@ -30,6 +14,12 @@ if [[ $# -ne 1 ]]; then
     exit 1
 fi
 DEVICE="$1"
+
+# Resolve a mapped name (e.g. "frontcam" or "/dev/frontcam") to its real /dev/videoX node
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MAP_CAMS_SCRIPT="$SCRIPT_DIR/map_cams.sh"
+RESOLVED=$("$MAP_CAMS_SCRIPT" -n "$DEVICE" 2>/dev/null || true)
+[[ -n "$RESOLVED" ]] && DEVICE="$RESOLVED"
 
 PIDFILE="/tmp/streamserver-$(basename "$DEVICE").pid"
 PID=$(cat "$PIDFILE" 2>/dev/null || true)

@@ -142,7 +142,8 @@ MainWindow::MainWindow(QWidget *parent) : QWidget(parent) {
   _stack->addWidget(_connectPage);
   _stack->setCurrentWidget(_connectPage);
 
-  resize(900, 700);
+  // Fullscreen/maximize breaks the layout irreversibly, so lock the window size.
+  setFixedSize(900, 700);
 }
 
 MainWindow::~MainWindow() {
