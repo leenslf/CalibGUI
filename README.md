@@ -46,6 +46,7 @@ Stream parameters: 1280×720, YUY2 input at 10 fps, sent as UYVY at 2 fps.
 CalibGUI runs both of these itself, there's no need to run them by hand
 except to debug connectivity.
 
+// TODO: was this necessary?
 Self-healing: if a previous stream for the same device is still running (e.g.
 from an abnormal client disconnect), `streamserver.sh` kills it before starting
 a new one, using a per-device PID file at `/tmp/streamserver-<device>.pid`.
