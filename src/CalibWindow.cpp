@@ -278,13 +278,13 @@ void CalibWindow::_handleInfoClicked() {
     "kenarlarını ve köşelerini de mutlaka dahil edin.\n"
     "3. Her pozisyonda tahtayı bir an sabit tutup 'Kare Kaydet' düğmesine (veya "
     "Boşluk tuşuna) basarak kare kaydedin.\n"
-    "4. Kalibrasyon için en az %1 kare gerekir; ne kadar çeşitli açı ve mesafe "
-    "kullanırsanız sonuç o kadar güvenilir olur.\n"
+    "4. Kalibrasyon için en az %1 kare gerekir; önerilen aralık kamera başına 10–20 karedir. "
+    "Ne kadar çeşitli açı ve mesafe kullanırsanız sonuç o kadar güvenilir olur.\n"
     "5. Yeterli kare biriktikten sonra 'KALİBRE ET' düğmesine basın.\n"
     "6. Kalibrasyon tamamlandığında 'Distorsiyonu Düzelt' düğmesini işaretleyerek "
     "sonucu görsel olarak kontrol edebilirsiniz.\n\n"
     "Kullanılan tahta ayarları: %2 x %3 kare, kare boyutu %4 mm, marker boyutu %5 mm.")
-    .arg(CalibTools::kFrameCount)
+    .arg(CalibTools::kMinFrameCount)
     .arg(_settings.squaresX)
     .arg(_settings.squaresY)
     .arg(_settings.squareLengthM * 1000.0, 0, 'f', 1)
@@ -329,8 +329,7 @@ void CalibWindow::_RefreshSavedFrameCount() {
 }
 
 void CalibWindow::_UpdateSaveFrameCounter() {
-  _saveFrameCounter->setText(
-    QString("Kare: %1/%2").arg(_savedFrameCount).arg(CalibTools::kFrameCount));
+  _saveFrameCounter->setText(QString("Kare: %1").arg(_savedFrameCount));
 }
 
 void CalibWindow::_ShowStatus(const std::string &msg, bool error) {
@@ -367,6 +366,12 @@ void CalibWindow::_handleSaveFrame() {
 
 void CalibWindow::_handleCalibrate() {
   if (_calibWatcher && _calibWatcher->isRunning()) return;
+
+  if (_savedFrameCount < CalibTools::kMinFrameCount) {
+    _ShowStatus(QString("Kalibrasyon için en az %1 kare gereklidir (şu an: %2).")
+                  .arg(CalibTools::kMinFrameCount).arg(_savedFrameCount).toStdString(), true);
+    return;
+  }
 
   if (!_calibWatcher) {
     _calibWatcher = new QFutureWatcher<CalibrationResult>(this);

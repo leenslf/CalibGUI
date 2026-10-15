@@ -23,7 +23,7 @@ struct CalibrationResult {
 
 class CalibTools {
 public:
-  static constexpr int kFrameCount = 30;
+  static constexpr int kMinFrameCount = 3;
 
   // Runs the full ChArUco calibration pipeline 
   static CalibrationResult RunCalibration(std::string path, CalibSettings settings);

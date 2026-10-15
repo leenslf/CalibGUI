@@ -36,9 +36,9 @@ CalibrationResult CalibTools::RunCalibration(std::string path, CalibSettings set
   std::vector<cv::String> filenames;
   GlobFrameFiles(path, &filenames);
 
-  if ((int) filenames.size() < kFrameCount) {
-    result.errorMessage = QString("HATA: Kalibrasyon için yeterli kare yok (%1 / %2).")
-      .arg((int) filenames.size()).arg(kFrameCount);
+  if ((int) filenames.size() < kMinFrameCount) {
+    result.errorMessage = QString("HATA: Kalibrasyon için yeterli kare yok (%1). En az %2 kare gereklidir.")
+      .arg((int) filenames.size()).arg(kMinFrameCount);
     return result;
   }
 
